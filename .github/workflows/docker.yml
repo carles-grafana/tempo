@@ -273,6 +273,9 @@ on:
   push:
     branches:
       - 'main'
+      - 'r[0-9]+'
+    tags:
+      - 'v*'
 
 # Needed to login to DockerHub
 permissions:
@@ -282,6 +285,7 @@ permissions:
 jobs:
 
   get-image-tag:
+    if: github.repository == 'grafana/tempo'  # skip in forks
     runs-on: ubuntu-24.04
     outputs:
       tag: ${{ steps.get-tag.outputs.tag }}
@@ -294,6 +298,7 @@ jobs:
           echo "tag=$(./tools/image-tag)" >> "$GITHUB_OUTPUT"
 
   docker:
+    if: github.repository == 'grafana/tempo'
     needs: get-image-tag
     strategy:
       matrix:
@@ -335,6 +340,8 @@ jobs:
           #docker manifest push grafana/${{ matrix.component }}:latest
 
 #  cd-to-dev-env:
+#    # This job deploys the latest main commit to the dev environment
+#    if: github.repository == 'grafana/tempo' && github.ref == 'refs/heads/main'
 #    runs-on: ubuntu-24.04
 #    steps:
 #      - name: Checkout
@@ -361,7 +368,7 @@ jobs:
 #            GITHUB_APP_ID=updater-app:app-id
 #            GITHUB_APP_INSTALLATION_ID=updater-app:app-installation-id
 #            GITHUB_APP_PRIVATE_KEY=updater-app:private-key
-
+#
 #      - name: Update jsonnet
 #        run: |
 #          set -e -o pipefail
