@@ -1,6 +1,7 @@
 package secrets
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -13,7 +14,7 @@ import (
 // release baseline. These synthetic workloads deliberately include slow paths;
 // they are not a weighted model of production traffic.
 func BenchmarkDetectionWorkloads(b *testing.B) {
-	policy, err := testPolicyCompiler.CompilePolicy(evaluationCustomPolicy(maxPolicyCustomRules, `tenant_[A-Za-z0-9]{16,40}`))
+	policy, err := testPolicyCompiler.CompilePolicy(context.Background(), evaluationCustomPolicy(maxPolicyCustomRules, `tenant_[A-Za-z0-9]{16,40}`))
 	require.NoError(b, err)
 	benchmarkDetectionWorkloads(b, fmt.Sprintf("custom-%d", maxPolicyCustomRules), policy)
 }
@@ -33,7 +34,7 @@ var benchmarkCompiledPolicy *CompiledPolicy
 // These synthetic workloads exercise optimization fallback and resource limits,
 // not a weighted model of production traffic.
 func BenchmarkDetectionCompilation(b *testing.B) {
-	_, err := testPolicyCompiler.CompilePolicy(Policy{})
+	_, err := testPolicyCompiler.CompilePolicy(context.Background(), Policy{})
 	require.NoError(b, err)
 	// Each near-limit rule has 65,000 repeated rune instructions, a ten-byte
 	// literal prefix and two terminal instructions: 1,040,192 across 16 rules,
@@ -65,7 +66,7 @@ func BenchmarkDetectionCompilation(b *testing.B) {
 		b.Run(test.name, func(b *testing.B) {
 			b.ReportAllocs()
 			for range b.N {
-				policy, err := testPolicyCompiler.CompilePolicy(spec)
+				policy, err := testPolicyCompiler.CompilePolicy(context.Background(), spec)
 				if err != nil {
 					b.Fatal(err)
 				}

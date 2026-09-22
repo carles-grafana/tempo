@@ -91,6 +91,9 @@ type Client interface {
 	// List tenants that have user-configurable overrides.
 	List(ctx context.Context) ([]string, error)
 	// Get the user-configurable overrides. Returns backend.ErrDoesNotExist if no limits are set.
+	// A rejected persisted policy returns nil limits, its current version, and
+	// ErrInvalidSecretsPolicy. That version may be used for conditional repair
+	// through Set or Delete; the rejected document must not be reconstructed.
 	Get(context.Context, string) (*Limits, backend.Version, error)
 	// Set the user-configurable overrides. Returns backend.ErrVersionDoesNotMatch if the backend
 	// has a newer version.

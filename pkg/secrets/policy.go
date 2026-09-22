@@ -41,6 +41,32 @@ func (c FeatureConfig) Validate() error {
 type Policy struct {
 	DisabledRules []string     `yaml:"disabled_rules,omitempty" json:"disabled_rules,omitempty"`
 	CustomRules   []CustomRule `yaml:"custom_rules,omitempty" json:"custom_rules,omitempty"`
+	rejected      bool
+}
+
+var errRejectedPolicy = errors.New("invalid secrets policy schema")
+
+// RejectedPolicy represents a policy-local decode failure without retaining any
+// rejected content. Providers keep their last-good policy or selected baseline.
+func RejectedPolicy() Policy {
+	return Policy{rejected: true}
+}
+
+// A rejected marker must not round-trip as a valid empty policy.
+func (p Policy) MarshalJSON() ([]byte, error) {
+	if p.rejected {
+		return nil, errRejectedPolicy
+	}
+	type plainPolicy Policy
+	return json.Marshal(plainPolicy(p))
+}
+
+func (p Policy) MarshalYAML() (any, error) {
+	if p.rejected {
+		return nil, errRejectedPolicy
+	}
+	type plainPolicy Policy
+	return plainPolicy(p), nil
 }
 
 type CustomRule struct {
@@ -103,6 +129,9 @@ func (c *PolicyCompiler) compilePolicy(policy Policy) (*CompiledPolicy, error) {
 }
 
 func validatePolicyBounds(policy Policy) error {
+	if policy.rejected {
+		return errRejectedPolicy
+	}
 	if len(policy.DisabledRules) > len(nativeRuleSpecs) {
 		return errors.New("secrets policy has too many disabled rules")
 	}
@@ -211,7 +240,7 @@ func compileCustomRules(custom []CustomRule) (compiledRuleSet, error) {
 }
 
 func isBaselinePolicy(policy Policy) bool {
-	return len(policy.CustomRules) == 0 && len(policy.DisabledRules) == 0
+	return !policy.rejected && len(policy.CustomRules) == 0 && len(policy.DisabledRules) == 0
 }
 
 // Bound expanded exact regexp programs before regexp.Compile or Simplify.

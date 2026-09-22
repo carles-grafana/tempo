@@ -53,9 +53,14 @@ type Generator struct {
 	cfg       *Config
 	overrides metricsGeneratorOverrides
 
-	instancesMtx    sync.RWMutex
-	instances       map[string]*instance
-	failedInstances map[string]time.Time // instance -> when creation last failed
+	instancesMtx sync.RWMutex
+	instances    map[string]*instance
+
+	// Serialize WAL construction without blocking lookups of existing tenants.
+	// Also protects failedInstances and the shutdown publication barrier.
+	instancesCreationMtx sync.Mutex
+	instancesClosed      bool
+	failedInstances      map[string]time.Time // instance -> when creation last failed
 
 	// When set to true, the generator will refuse incoming pushes
 	// and will flush any remaining metrics.
@@ -183,6 +188,12 @@ func (g *Generator) stopping(_ error) error {
 		g.stopKafka()
 	}
 
+	// Finish an in-progress construction and prevent publication after shutdown
+	// starts iterating. Kafka workers have already drained above.
+	g.instancesCreationMtx.Lock()
+	g.instancesClosed = true
+	g.instancesCreationMtx.Unlock()
+
 	var wg sync.WaitGroup
 	wg.Add(len(g.instances))
 
@@ -234,11 +245,14 @@ func (g *Generator) getOrCreateInstance(instanceID string) (*instance, error) {
 		return inst, nil
 	}
 
-	g.instancesMtx.Lock()
-	defer g.instancesMtx.Unlock()
+	g.instancesCreationMtx.Lock()
+	defer g.instancesCreationMtx.Unlock()
+	if g.instancesClosed {
+		return nil, ErrReadOnly
+	}
 
-	// Double-check after acquiring write lock
-	if inst, ok := g.instances[instanceID]; ok {
+	// Another caller may have created this tenant while we waited.
+	if inst, ok := g.getInstanceByID(instanceID); ok {
 		return inst, nil
 	}
 
@@ -259,7 +273,9 @@ func (g *Generator) getOrCreateInstance(instanceID string) (*instance, error) {
 		return nil, err
 	}
 
+	g.instancesMtx.Lock()
 	g.instances[instanceID] = inst
+	g.instancesMtx.Unlock()
 	return inst, nil
 }
 

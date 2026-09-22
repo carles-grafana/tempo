@@ -25,7 +25,7 @@ var testPolicyCompiler = func() *PolicyCompiler {
 }()
 
 func TestPolicyDetectsEveryNativeFixtureByDefault(t *testing.T) {
-	policy, err := testPolicyCompiler.CompilePolicy(Policy{})
+	policy, err := testPolicyCompiler.CompilePolicy(context.Background(), Policy{})
 	require.NoError(t, err)
 	assertNativeFixtureDetection(t, policy)
 }
@@ -46,7 +46,7 @@ func TestDisabledRulesPreserveOtherNativeAndCustomFindings(t *testing.T) {
 		{"both-disabled", []string{"github-pat", "generic-api-key"}, []Match{{RuleID: "acme-key"}}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			policy, err := testPolicyCompiler.CompilePolicy(Policy{DisabledRules: test.disabled, CustomRules: []CustomRule{custom}})
+			policy, err := testPolicyCompiler.CompilePolicy(context.Background(), Policy{DisabledRules: test.disabled, CustomRules: []CustomRule{custom}})
 			require.NoError(t, err)
 			want := Verdict{Matches: test.want}
 			require.Equal(t, want, fullScanPolicyVerdict(policy, value))
@@ -67,7 +67,7 @@ func TestExclusionOrderPreservesNativeLexicalAndCustomConfiguredOrder(t *testing
 		{"aws-secret-access-key", "github-pat"},
 		{"github-pat", "aws-secret-access-key"},
 	} {
-		policy, err := testPolicyCompiler.CompilePolicy(Policy{DisabledRules: ids, CustomRules: custom})
+		policy, err := testPolicyCompiler.CompilePolicy(context.Background(), Policy{DisabledRules: ids, CustomRules: custom})
 		require.NoError(t, err)
 		want := Verdict{Matches: []Match{{RuleID: "gcp-api-key"}, {RuleID: "generic-api-key"}, {RuleID: "z-custom"}, {RuleID: "a-custom"}}}
 		require.Equal(t, want, fullScanPolicyVerdict(policy, value))
@@ -79,7 +79,7 @@ func TestExclusionOrderPreservesNativeLexicalAndCustomConfiguredOrder(t *testing
 
 func TestRequestExclusionsPreserveSharedRegexValidatorsAndDirectCarriers(t *testing.T) {
 	fixtures := nativeCatalogFixtures(t)
-	defaults, err := testPolicyCompiler.CompilePolicy(Policy{})
+	defaults, err := testPolicyCompiler.CompilePolicy(context.Background(), Policy{})
 	require.NoError(t, err)
 	canny := fixtures["canny-api-request"].Positive[0]
 	calorie := fixtures["calorieninjas-api-request"].Positive[0]
@@ -104,7 +104,7 @@ func TestRequestExclusionsPreserveSharedRegexValidatorsAndDirectCarriers(t *test
 	// Publish every selection first: a shared regex must not share its rule's
 	// validator or mutate an earlier policy's exclusions.
 	for i := range cases {
-		cases[i].policy, err = testPolicyCompiler.CompilePolicy(Policy{DisabledRules: cases[i].ids})
+		cases[i].policy, err = testPolicyCompiler.CompilePolicy(context.Background(), Policy{DisabledRules: cases[i].ids})
 		require.NoError(t, err)
 	}
 	for _, test := range cases {
@@ -126,7 +126,7 @@ func TestRequestExclusionsPreserveSharedRegexValidatorsAndDirectCarriers(t *test
 }
 
 func TestNativeExclusionsAcrossBitsetWordBoundaries(t *testing.T) {
-	defaults, err := testPolicyCompiler.CompilePolicy(Policy{})
+	defaults, err := testPolicyCompiler.CompilePolicy(context.Background(), Policy{})
 	require.NoError(t, err)
 	ids, err := CatalogRuleIDs()
 	require.NoError(t, err)
@@ -135,7 +135,7 @@ func TestNativeExclusionsAcrossBitsetWordBoundaries(t *testing.T) {
 	for i, index := range indexes {
 		disabled[i] = ids[index]
 	}
-	policy, err := testPolicyCompiler.CompilePolicy(Policy{DisabledRules: disabled})
+	policy, err := testPolicyCompiler.CompilePolicy(context.Background(), Policy{DisabledRules: disabled})
 	require.NoError(t, err)
 	batch := policy.NewBatchDetector()
 	fixtures := nativeCatalogFixtures(t)
@@ -172,9 +172,9 @@ func TestNoNativeRulesPreserveNullableCustomRules(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			compiler, err := NewPolicyCompiler(test.selected)
 			require.NoError(t, err)
-			disabled, err := compiler.CompilePolicy(Policy{DisabledRules: test.disabled})
+			disabled, err := compiler.CompilePolicy(context.Background(), Policy{DisabledRules: test.disabled})
 			require.NoError(t, err)
-			custom, err := compiler.CompilePolicy(Policy{
+			custom, err := compiler.CompilePolicy(context.Background(), Policy{
 				DisabledRules: test.disabled,
 				CustomRules:   []CustomRule{{ID: "empty-or-custom", Regex: `^$|CUSTOM`}},
 			})
@@ -214,7 +214,7 @@ func TestPolicyRejectsInvalidDisabledRulesSafely(t *testing.T) {
 		{"too-many", make([]string, len(nativeRuleSpecs)+1)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			compiled, err := testPolicyCompiler.CompilePolicy(Policy{
+			compiled, err := testPolicyCompiler.CompilePolicy(context.Background(), Policy{
 				DisabledRules: test.ids,
 				CustomRules:   []CustomRule{{ID: "tenant-custom", Regex: "CUSTOM"}},
 			})
@@ -228,7 +228,7 @@ func TestPolicyRejectsInvalidDisabledRulesSafely(t *testing.T) {
 }
 
 func TestBatchDetectorMatchesCompiledPolicyAndProtectsCache(t *testing.T) {
-	policy, err := testPolicyCompiler.CompilePolicy(Policy{CustomRules: []CustomRule{{ID: "custom", Regex: `CUSTOM-[0-9]{3}`}}})
+	policy, err := testPolicyCompiler.CompilePolicy(context.Background(), Policy{CustomRules: []CustomRule{{ID: "custom", Regex: `CUSTOM-[0-9]{3}`}}})
 	require.NoError(t, err)
 	detector := policy.NewBatchDetector()
 	values := []string{
@@ -250,18 +250,18 @@ func TestBatchDetectorMatchesCompiledPolicyAndProtectsCache(t *testing.T) {
 }
 
 func TestPolicyRejectsInvalidCustomRules(t *testing.T) {
-	_, err := testPolicyCompiler.CompilePolicy(Policy{CustomRules: []CustomRule{{ID: "bad rule ID", Regex: "secret"}}})
+	_, err := testPolicyCompiler.CompilePolicy(context.Background(), Policy{CustomRules: []CustomRule{{ID: "bad rule ID", Regex: "secret"}}})
 	require.Error(t, err)
 
-	_, err = testPolicyCompiler.CompilePolicy(Policy{CustomRules: []CustomRule{{ID: "broken", Regex: "("}}})
+	_, err = testPolicyCompiler.CompilePolicy(context.Background(), Policy{CustomRules: []CustomRule{{ID: "broken", Regex: "("}}})
 	require.Error(t, err)
 
-	_, err = testPolicyCompiler.CompilePolicy(Policy{CustomRules: []CustomRule{{ID: nativeRuleSpecs[0].ID, Regex: "secret"}}})
+	_, err = testPolicyCompiler.CompilePolicy(context.Background(), Policy{CustomRules: []CustomRule{{ID: nativeRuleSpecs[0].ID, Regex: "secret"}}})
 	require.Error(t, err)
 
 	// Excluded native rules still reserve their IDs; a custom rule cannot
 	// replace the supported native implementation.
-	_, err = testPolicyCompiler.CompilePolicy(Policy{DisabledRules: []string{"generic-api-key"}, CustomRules: []CustomRule{{ID: "generic-api-key", Regex: "secret"}}})
+	_, err = testPolicyCompiler.CompilePolicy(context.Background(), Policy{DisabledRules: []string{"generic-api-key"}, CustomRules: []CustomRule{{ID: "generic-api-key", Regex: "secret"}}})
 	require.Error(t, err)
 }
 
@@ -280,7 +280,7 @@ func TestCustomRuleCountLimit(t *testing.T) {
 	}
 	t.Run("sixteen-valid-rules", func(t *testing.T) {
 		input, value, expected := makePolicy(16)
-		policy, err := testPolicyCompiler.CompilePolicy(input)
+		policy, err := testPolicyCompiler.CompilePolicy(context.Background(), input)
 		require.NoError(t, err)
 		require.Equal(t, Verdict{Matches: expected}, policy.Detect(value))
 		batch := policy.NewBatchDetector()
@@ -292,7 +292,7 @@ func TestCustomRuleCountLimit(t *testing.T) {
 		input.DisabledRules, err = CatalogRuleIDs()
 		require.NoError(t, err)
 		value += "\n" + `api_key="r9Q2m7V4x1Z8c6B3n0H5j2L9p4T7w8Y1"`
-		policy, err := testPolicyCompiler.CompilePolicy(input)
+		policy, err := testPolicyCompiler.CompilePolicy(context.Background(), input)
 		require.NoError(t, err)
 		require.Equal(t, Verdict{Matches: expected}, policy.Detect(value))
 		batch := policy.NewBatchDetector()
@@ -300,7 +300,7 @@ func TestCustomRuleCountLimit(t *testing.T) {
 	})
 	t.Run("seventeen-valid-rules-rejected-not-truncated", func(t *testing.T) {
 		input, _, _ := makePolicy(17)
-		policy, err := testPolicyCompiler.CompilePolicy(input)
+		policy, err := testPolicyCompiler.CompilePolicy(context.Background(), input)
 		require.Error(t, err)
 		require.Nil(t, policy)
 	})
@@ -321,7 +321,7 @@ func TestPolicyCompileErrorsDoNotExposeConfiguration(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			compiled, err := testPolicyCompiler.CompilePolicy(Policy{CustomRules: test.rules})
+			compiled, err := testPolicyCompiler.CompilePolicy(context.Background(), Policy{CustomRules: test.rules})
 			require.Error(t, err)
 			require.Nil(t, compiled)
 			require.NotContains(t, err.Error(), private)
@@ -333,7 +333,7 @@ func TestPolicyBoundsExpandedRegexPrograms(t *testing.T) {
 	t.Run("single-expression", func(t *testing.T) {
 		// Under the source-byte limit, but more than a million instructions
 		// after counted repetition expansion.
-		compiled, err := testPolicyCompiler.CompilePolicy(Policy{CustomRules: []CustomRule{{
+		compiled, err := testPolicyCompiler.CompilePolicy(context.Background(), Policy{CustomRules: []CustomRule{{
 			ID: "wide", Regex: "(?:" + strings.Repeat("ab", 600) + "){1000}",
 		}}})
 		require.Error(t, err)
@@ -342,14 +342,14 @@ func TestPolicyBoundsExpandedRegexPrograms(t *testing.T) {
 	t.Run("aggregate", func(t *testing.T) {
 		// Each expression fits; only the policy-wide expansion exceeds the cap.
 		copies := maxCustomPolicyInstructions/(1000*maxPolicyCustomRules) + 1
-		compiled, err := testPolicyCompiler.CompilePolicy(evaluationCustomPolicy(maxPolicyCustomRules, strings.Repeat(`[ab]{1000}`, copies)))
+		compiled, err := testPolicyCompiler.CompilePolicy(context.Background(), evaluationCustomPolicy(maxPolicyCustomRules, strings.Repeat(`[ab]{1000}`, copies)))
 		require.Error(t, err)
 		require.Nil(t, compiled)
 	})
 	t.Run("optimization-caps-still-accepted", func(t *testing.T) {
 		// The NFA fallback benchmark is a supported policy, not a resource
 		// rejection. Keep this independent of whether a DFA can be built.
-		_, err := testPolicyCompiler.CompilePolicy(evaluationCustomPolicy(maxPolicyCustomRules, strings.Repeat(`[ab]{1000}`, 5)))
+		_, err := testPolicyCompiler.CompilePolicy(context.Background(), evaluationCustomPolicy(maxPolicyCustomRules, strings.Repeat(`[ab]{1000}`, 5)))
 		require.NoError(t, err)
 	})
 }
@@ -445,7 +445,7 @@ func TestPolicyMinimumWidthPreservesCustomRules(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			policy, err := testPolicyCompiler.CompilePolicy(Policy{CustomRules: []CustomRule{{ID: "tenant", Regex: test.expression}}})
+			policy, err := testPolicyCompiler.CompilePolicy(context.Background(), Policy{CustomRules: []CustomRule{{ID: "tenant", Regex: test.expression}}})
 			require.NoError(t, err)
 			batch := policy.NewBatchDetector()
 			for i, value := range test.values {
@@ -462,7 +462,7 @@ func TestPolicyMinimumWidthPreservesCustomRules(t *testing.T) {
 }
 
 func TestPolicyVerdictMatchesFullScan(t *testing.T) {
-	policy, err := testPolicyCompiler.CompilePolicy(Policy{CustomRules: []CustomRule{
+	policy, err := testPolicyCompiler.CompilePolicy(context.Background(), Policy{CustomRules: []CustomRule{
 		{ID: "z-regex", Regex: `S:([A-Za-z0-9]{8})`},
 		{ID: "a-capture", Regex: `S:([A-Za-z0-9]{8})`},
 		{ID: "empty", Regex: `^$`},
@@ -489,7 +489,7 @@ func TestPolicyVerdictMatchesFullScan(t *testing.T) {
 	// Each rule reports once even when the value contains multiple matches.
 	require.Equal(t, Verdict{Matches: []Match{{RuleID: "z-regex"}, {RuleID: "a-capture"}}},
 		policy.Detect("S:aaaaaaaa S:Ab12Cd34 S:Cd34Ef56"))
-	baseline, err := testPolicyCompiler.CompilePolicy(Policy{})
+	baseline, err := testPolicyCompiler.CompilePolicy(context.Background(), Policy{})
 	require.NoError(t, err)
 	witness := findCatalogRuleWitness(t, baseline.catalog, 0)
 	nativeFirst := baseline.Detect(witness)
@@ -700,7 +700,7 @@ func TestPolicyCustomExpressionsMatchFullScan(t *testing.T) {
 	require.NoError(t, err)
 	for _, test := range customPolicyVerdictCases() {
 		t.Run(test.name, func(t *testing.T) {
-			policy, err := compiler.CompilePolicy(Policy{CustomRules: test.rules})
+			policy, err := compiler.CompilePolicy(context.Background(), Policy{CustomRules: test.rules})
 			require.NoError(t, err)
 			wants := make([]Verdict, len(test.probes))
 			batch := policy.NewBatchDetector()
@@ -740,16 +740,16 @@ func TestPolicyCustomExpressionsMatchFullScan(t *testing.T) {
 }
 
 func FuzzPolicyVerdictMatchesFullScan(f *testing.F) {
-	baseline, err := testPolicyCompiler.CompilePolicy(Policy{})
+	baseline, err := testPolicyCompiler.CompilePolicy(context.Background(), Policy{})
 	require.NoError(f, err)
-	custom, err := testPolicyCompiler.CompilePolicy(Policy{CustomRules: []CustomRule{
+	custom, err := testPolicyCompiler.CompilePolicy(context.Background(), Policy{CustomRules: []CustomRule{
 		{ID: "unanchored", Regex: `T:([A-Za-z0-9]{8})`},
 		{ID: "line", Regex: `(?m)^T:[A-Za-z0-9]{8}$`},
 		{ID: "nullable", Regex: `(?i)k*`},
 		{ID: "binary", Regex: `\x{FFFD}{1,2}`},
 	}})
 	require.NoError(f, err)
-	exclusions, err := testPolicyCompiler.CompilePolicy(Policy{DisabledRules: []string{"generic-api-key", "canny-api-request", "github-pat"}})
+	exclusions, err := testPolicyCompiler.CompilePolicy(context.Background(), Policy{DisabledRules: []string{"generic-api-key", "canny-api-request", "github-pat"}})
 	require.NoError(f, err)
 	type seed struct {
 		value string
@@ -786,7 +786,7 @@ func FuzzPolicyVerdictMatchesFullScan(f *testing.F) {
 	customOnlyCompiler, err := NewPolicyCompiler(&[]string{})
 	require.NoError(f, err)
 	for _, test := range customPolicyVerdictCases() {
-		policy, err := customOnlyCompiler.CompilePolicy(Policy{CustomRules: test.rules})
+		policy, err := customOnlyCompiler.CompilePolicy(context.Background(), Policy{CustomRules: test.rules})
 		require.NoError(f, err)
 		policies = append(policies, policy)
 		for _, probe := range test.probes {
@@ -805,7 +805,7 @@ func FuzzPolicyVerdictMatchesFullScan(f *testing.F) {
 }
 
 func BenchmarkPolicyEvaluation(b *testing.B) {
-	policy, err := testPolicyCompiler.CompilePolicy(Policy{})
+	policy, err := testPolicyCompiler.CompilePolicy(context.Background(), Policy{})
 	require.NoError(b, err)
 	cases := []struct{ name, value string }{
 		{"method", "GET"},
@@ -844,7 +844,7 @@ func BenchmarkPolicyEvaluation(b *testing.B) {
 
 func TestCustomPlanReusePreservesAcceptanceAndIDs(t *testing.T) {
 	const expression = `(MEM:([A-Z0-9]{8}))`
-	policy, err := testPolicyCompiler.CompilePolicy(Policy{CustomRules: []CustomRule{
+	policy, err := testPolicyCompiler.CompilePolicy(context.Background(), Policy{CustomRules: []CustomRule{
 		{ID: "same-a", Regex: expression},
 		{ID: "same-b", Regex: expression},
 	}})
@@ -914,7 +914,7 @@ func TestCustomPlanReusePreservesPublishedSnapshots(t *testing.T) {
 func TestFeatureConfigSelectionSerialization(t *testing.T) {
 	fixtures := nativeCatalogFixtures(t)
 	value := fixtures["github-pat"].Positive[0] + "\n" + fixtures["gcp-api-key"].Positive[0]
-	all, err := testPolicyCompiler.CompilePolicy(Policy{})
+	all, err := testPolicyCompiler.CompilePolicy(context.Background(), Policy{})
 	require.NoError(t, err)
 	for _, codec := range []struct {
 		name      string
@@ -944,7 +944,7 @@ func TestFeatureConfigSelectionSerialization(t *testing.T) {
 					require.Equal(t, test.all, cfg.EnabledRules == nil)
 					compiler, err := NewPolicyCompiler(cfg.EnabledRules)
 					require.NoError(t, err)
-					policy, err := compiler.CompilePolicy(Policy{})
+					policy, err := compiler.CompilePolicy(context.Background(), Policy{})
 					require.NoError(t, err)
 					require.Equal(t, test.want, policy.Detect(value))
 					input, err = codec.marshal(cfg)
@@ -957,7 +957,7 @@ func TestFeatureConfigSelectionSerialization(t *testing.T) {
 			for range 2 {
 				compiler, err := NewPolicyCompiler(cfg.EnabledRules)
 				require.NoError(t, err)
-				policy, err := compiler.CompilePolicy(Policy{})
+				policy, err := compiler.CompilePolicy(context.Background(), Policy{})
 				require.NoError(t, err)
 				require.Equal(t, Verdict{}, policy.Detect(value))
 				encoded, err := codec.marshal(cfg)
@@ -1008,15 +1008,15 @@ func TestPolicyCompilerSnapshotsSelectionAndIsolatesTenants(t *testing.T) {
 	require.NoError(t, err)
 	fixtures := nativeCatalogFixtures(t)
 	value := fixtures["github-pat"].Positive[0] + "\n" + fixtures["gcp-api-key"].Positive[0]
-	baseline, err := compiler.CompilePolicy(Policy{})
+	baseline, err := compiler.CompilePolicy(context.Background(), Policy{})
 	require.NoError(t, err)
-	first, err := compiler.CompilePolicy(Policy{DisabledRules: []string{"gcp-api-key"}})
+	first, err := compiler.CompilePolicy(context.Background(), Policy{DisabledRules: []string{"gcp-api-key"}})
 	require.NoError(t, err)
-	second, err := compiler.CompilePolicy(Policy{DisabledRules: []string{"github-pat"}})
+	second, err := compiler.CompilePolicy(context.Background(), Policy{DisabledRules: []string{"github-pat"}})
 	require.NoError(t, err)
-	otherPolicy, err := other.CompilePolicy(Policy{})
+	otherPolicy, err := other.CompilePolicy(context.Background(), Policy{})
 	require.NoError(t, err)
-	defaults, err := testPolicyCompiler.CompilePolicy(Policy{})
+	defaults, err := testPolicyCompiler.CompilePolicy(context.Background(), Policy{})
 	require.NoError(t, err)
 	otherWant := defaults.Detect(value)
 	otherWant.Matches = slices.DeleteFunc(otherWant.Matches, func(match Match) bool {
@@ -1044,7 +1044,7 @@ func TestPolicyCompilerSnapshotsSelectionAndIsolatesTenants(t *testing.T) {
 func TestPolicyCompilerValidatesInactiveNativeIDs(t *testing.T) {
 	compiler, err := NewPolicyCompiler(&[]string{"github-pat"})
 	require.NoError(t, err)
-	policy, err := compiler.CompilePolicy(Policy{DisabledRules: []string{"gcp-api-key", "generic-api-key"}})
+	policy, err := compiler.CompilePolicy(context.Background(), Policy{DisabledRules: []string{"gcp-api-key", "generic-api-key"}})
 	require.NoError(t, err)
 	value := nativeCatalogFixtures(t)["github-pat"].Positive[0]
 	want := Verdict{Matches: []Match{{RuleID: "github-pat"}}}
@@ -1055,7 +1055,7 @@ func TestPolicyCompilerValidatesInactiveNativeIDs(t *testing.T) {
 		{DisabledRules: []string{"gcp-api-key", "gcp-api-key"}},
 		{CustomRules: []CustomRule{{ID: "gcp-api-key", Regex: "CUSTOM"}}},
 	} {
-		rejected, err := compiler.CompilePolicy(input)
+		rejected, err := compiler.CompilePolicy(context.Background(), input)
 		require.Error(t, err)
 		require.Nil(t, rejected)
 		require.NotContains(t, err.Error(), "gcp-api-key")
@@ -1096,5 +1096,53 @@ func TestSelectedProviderFallbackAndRecoveryNeverExpandCoverage(t *testing.T) {
 				require.Equal(t, want, batch.Detect(value))
 			}
 		})
+	}
+}
+
+func TestRejectedPolicyRetainsLastGoodAndSelectedBaseline(t *testing.T) {
+	for _, selected := range [][]string{{"stripe-access-token"}, {}} {
+		t.Run(fmt.Sprintf("selected-%d", len(selected)), func(t *testing.T) {
+			compiler, err := NewPolicyCompiler(&selected)
+			require.NoError(t, err)
+			rejected := RejectedPolicy()
+			compiled, err := compiler.CompilePolicy(context.Background(), rejected)
+			require.Error(t, err)
+			require.Nil(t, compiled, "a schema error must not compile as an empty policy")
+			input := &rejected
+			provider := compiler.NewCompiledPolicyProvider("tenant", func(string) (*Policy, bool) {
+				return input, false
+			}, log.NewNopLogger())
+			value := "sk_test_" + "0123456789abcdefghijklmn" + "\nCUSTOM"
+			var native []Match
+			if len(selected) != 0 {
+				native = []Match{{RuleID: "stripe-access-token"}}
+			}
+			for _, step := range []struct {
+				input *Policy
+				want  []Match
+			}{
+				{&rejected, native},
+				{&Policy{DisabledRules: []string{"stripe-access-token"}, CustomRules: []CustomRule{{ID: "custom", Regex: "CUSTOM"}}}, []Match{{RuleID: "custom"}}},
+				{&rejected, []Match{{RuleID: "custom"}}},
+				{&Policy{}, native},
+				{&rejected, native},
+			} {
+				input = step.input
+				current, ok := provider(context.Background())
+				require.True(t, ok)
+				require.Equal(t, Verdict{Matches: step.want}, current.Detect(value))
+			}
+		})
+	}
+}
+
+func TestRejectedPolicyCannotSerializeAsValidEmptyPolicy(t *testing.T) {
+	rejected := RejectedPolicy()
+	for _, marshal := range []func(any) ([]byte, error){json.Marshal, yaml.Marshal} {
+		for _, value := range []any{rejected, &rejected, struct{ Policy Policy }{rejected}} {
+			data, err := marshal(value)
+			require.Error(t, err)
+			require.Empty(t, data)
+		}
 	}
 }

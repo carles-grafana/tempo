@@ -783,7 +783,7 @@ type mockValidator struct {
 	err error
 }
 
-func (m *mockValidator) Validate(_ *client.Limits) error {
+func (m *mockValidator) Validate(_ context.Context, _ *client.Limits) error {
 	return m.err
 }
 

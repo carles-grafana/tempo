@@ -9,16 +9,19 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/go-kit/log"
 	"github.com/grafana/dskit/services"
+	"github.com/grafana/dskit/user"
 	"github.com/grafana/tempo/modules/generator/processor"
 	"github.com/grafana/tempo/modules/generator/processor/spanmetrics"
 	"github.com/grafana/tempo/modules/generator/storage"
 	"github.com/grafana/tempo/modules/overrides"
 	"github.com/grafana/tempo/modules/overrides/histograms"
+	"github.com/grafana/tempo/pkg/secrets"
 	"github.com/grafana/tempo/pkg/tempopb"
 	common_v1 "github.com/grafana/tempo/pkg/tempopb/common/v1"
 	trace_v1 "github.com/grafana/tempo/pkg/tempopb/trace/v1"
@@ -148,6 +151,75 @@ func (l testLogger) Log(keyvals ...interface{}) error {
 	return nil
 }
 
+type blockingInitialPolicyOverrides struct {
+	mockOverrides
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (o *blockingInitialPolicyOverrides) SecretsPolicy(tenant string) (*secrets.Policy, bool) {
+	if tenant == "creating" {
+		o.once.Do(func() {
+			close(o.entered)
+			<-o.release
+		})
+	}
+	return dynamicInstancePolicy("tenant-rule", "INITIAL-POLICY"), false
+}
+
+func TestInitialPolicyResolutionDoesNotBlockExistingTenants(t *testing.T) {
+	cfg := &Config{}
+	cfg.RegisterFlagsAndApplyDefaults("", &flag.FlagSet{})
+	cfg.Storage.Path = t.TempDir()
+	cfg.Processor.SecretDetection.Enabled = true
+	compiler, err := secrets.NewPolicyCompiler(&[]string{})
+	require.NoError(t, err)
+	cfg.Processor.SecretDetection.PolicyCompiler = compiler
+	o := &blockingInitialPolicyOverrides{
+		mockOverrides: mockOverrides{processors: map[string]struct{}{processor.SecretDetectionName: {}}},
+		entered:       make(chan struct{}),
+		release:       make(chan struct{}),
+	}
+	logger := &dynamicInstanceLogger{}
+	g, err := New(cfg, o, prometheus.NewRegistry(), nil, logger)
+	require.NoError(t, err)
+	release := sync.OnceFunc(func() { close(o.release) })
+	stop := sync.OnceFunc(func() { require.NoError(t, g.stopping(nil)) })
+	t.Cleanup(func() {
+		release()
+		stop()
+	})
+	_, err = g.getOrCreateInstance("existing")
+	require.NoError(t, err)
+
+	push := func(tenant string, traceID byte) <-chan error {
+		done := make(chan error, 1)
+		go func() {
+			_, err := g.PushSpans(user.InjectOrgID(context.Background(), tenant), dynamicInstanceRequest(traceID, "INITIAL-POLICY"))
+			done <- err
+		}()
+		return done
+	}
+	first := push("creating", 1)
+	awaitInstancePolicy(t, o.entered)
+	duplicate := push("creating", 3)
+
+	// The existing tenant must finish while another tenant's initial policy is
+	// unresolved, not merely after the constructor releases its lock.
+	require.NoError(t, awaitInstancePolicy(t, push("existing", 2)))
+	require.Equal(t, []string{"tenant-rule"}, logger.rules("02"))
+	release()
+	require.NoError(t, awaitInstancePolicy(t, first))
+	require.NoError(t, awaitInstancePolicy(t, duplicate))
+	require.Equal(t, []string{"tenant-rule"}, logger.rules("01"))
+	require.Equal(t, []string{"tenant-rule"}, logger.rules("03"))
+
+	stop()
+	_, err = g.getOrCreateInstance("after-shutdown")
+	require.ErrorIs(t, err, ErrReadOnly)
+}
+
 // BenchmarkPushSpans measures WAL-inclusive pushSpans cost: randomized
 // test.MakeBatch fixtures pushed through an instance backed by a real WAL.
 // For deterministic, processor-only cost over a noop storage, use the
@@ -255,9 +327,9 @@ func TestGetOrCreateInstance_FailureCachingExpiry(t *testing.T) {
 	require.NotErrorIs(t, err, errInstanceCreationBackoff)
 
 	// Simulate backoff expiry by setting the failure time in the past
-	g.instancesMtx.Lock()
+	g.instancesCreationMtx.Lock()
 	g.failedInstances["tenant-1"] = time.Now().Add(-failureBackoff - time.Second)
-	g.instancesMtx.Unlock()
+	g.instancesCreationMtx.Unlock()
 
 	// After backoff expires, should retry (and fail again with actual error, not backoff error)
 	_, err = g.getOrCreateInstance("tenant-1")

@@ -246,7 +246,7 @@ func TestDynamicPolicySyntheticChurn(t *testing.T) {
 				tenants[index].steps = append(append([]syntheticDynamicStep(nil), steps[offset:]...), steps[:offset]...)
 				tenants[index].provider.tenant = fmt.Sprintf("synthetic-tenant-%d", index)
 				tenants[index].provider.admission = admission
-				tenants[index].provider.compile = compiler.CompilePolicy
+				tenants[index].provider.compile = compiler.compileAdmitted
 			}
 			for index := range tenants {
 				tenant := &tenants[index]
@@ -284,7 +284,7 @@ func TestDynamicPolicySyntheticChurn(t *testing.T) {
 					tenant.provider.compile = func(input Policy) (*CompiledPolicy, error) {
 						select {
 						case <-release[index]:
-							return compiler.CompilePolicy(input)
+							return compiler.compileAdmitted(input)
 						case <-ctx.Done():
 							return nil, ctx.Err()
 						}

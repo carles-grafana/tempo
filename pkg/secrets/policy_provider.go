@@ -99,7 +99,7 @@ func (c *PolicyCompiler) NewCompiledPolicyProvider(tenant string, policy func(st
 		policy:    policy,
 		logger:    logger,
 		updating:  make(chan struct{}, 1),
-		compile:   c.CompilePolicy,
+		compile:   c.compileAdmitted,
 		admission: policyCompilationSlots,
 		metrics:   policyUpdates,
 	}
@@ -156,7 +156,7 @@ func (p *compiledPolicyProvider) current(ctx context.Context) (*CompiledPolicy, 
 		if !rejected {
 			input.policy = clonePolicy(input.policy)
 			var err error
-			compiled, err = p.compileTimed(input.policy)
+			compiled, err = p.metrics.compile(p.compile, input.policy)
 			rejected = err != nil
 		}
 		// regexp.Compile is not interruptible. Keep its slot until it returns,
@@ -173,7 +173,7 @@ func (p *compiledPolicyProvider) current(ctx context.Context) (*CompiledPolicy, 
 		if rejected && (previous == nil || previous.compiled == nil) {
 			// Invalid initial overrides fail open to this compiler's selected
 			// baseline, under the same admission bound as custom policies.
-			compiled, _ = p.compileTimed(Policy{})
+			compiled, _ = p.metrics.compile(p.compile, Policy{})
 		}
 		<-p.admission
 
@@ -220,20 +220,23 @@ func (p *compiledPolicyProvider) effectivePolicy() policyInput {
 	if input == nil {
 		return policyInput{}
 	}
+	if input.rejected {
+		return policyInput{policy: RejectedPolicy()}
+	}
 	if validatePolicyBounds(*input) != nil {
 		return policyInput{oversized: true}
 	}
 	return policyInput{policy: *input}
 }
 
-func (p *compiledPolicyProvider) compileTimed(input Policy) (*CompiledPolicy, error) {
-	p.metrics.active.Inc()
+func (m *policyUpdateMetrics) compile(compile func(Policy) (*CompiledPolicy, error), input Policy) (*CompiledPolicy, error) {
+	m.active.Inc()
 	started := time.Now()
 	defer func() {
-		p.metrics.duration.Observe(time.Since(started).Seconds())
-		p.metrics.active.Dec()
+		m.duration.Observe(time.Since(started).Seconds())
+		m.active.Dec()
 	}()
-	return p.compile(input)
+	return compile(input)
 }
 
 func (p *compiledPolicyProvider) canceled() (*CompiledPolicy, bool) {
@@ -256,6 +259,6 @@ func clonePolicy(policy Policy) Policy {
 }
 
 func policiesEqual(left, right Policy) bool {
-	return slices.Equal(left.DisabledRules, right.DisabledRules) &&
+	return left.rejected == right.rejected && slices.Equal(left.DisabledRules, right.DisabledRules) &&
 		slices.Equal(left.CustomRules, right.CustomRules)
 }

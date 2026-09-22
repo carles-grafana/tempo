@@ -2,6 +2,7 @@ package secrets
 
 import (
 	"cmp"
+	"context"
 	"errors"
 	"fmt"
 	"slices"
@@ -63,7 +64,32 @@ func newPolicyCompiler(enabledRules *[]string) (*PolicyCompiler, error) {
 
 // CompilePolicy applies tenant exclusions and custom rules within this
 // compiler's native selection. It never changes the shared native catalog.
-func (c *PolicyCompiler) CompilePolicy(policy Policy) (*CompiledPolicy, error) {
+// Admission is shared with providers across the process and can be canceled.
+// Once compilation starts, cancellation waits for the non-interruptible regexp
+// work to finish; canceled work is never returned to the caller.
+func (c *PolicyCompiler) CompilePolicy(ctx context.Context, policy Policy) (*CompiledPolicy, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	select {
+	case policyCompilationSlots <- struct{}{}:
+		defer func() { <-policyCompilationSlots }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	compiled, err := policyUpdates.compile(c.compileAdmitted, policy)
+	if canceled := ctx.Err(); canceled != nil {
+		return nil, canceled
+	}
+	return compiled, err
+}
+
+// compileAdmitted requires the caller to hold process-wide admission. Providers
+// hold that slot across source freshness checks and initial native fallback.
+func (c *PolicyCompiler) compileAdmitted(policy Policy) (*CompiledPolicy, error) {
 	if isBaselinePolicy(policy) {
 		return c.baseline()
 	}

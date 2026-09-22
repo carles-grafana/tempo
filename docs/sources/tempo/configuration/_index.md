@@ -1057,11 +1057,13 @@ For opted-in tenants, policy at `metrics_generator.processor.secret_detection` c
 
 Finding logs contain `msg="secret detected in trace field"`, `tenant`, `traceID`, optional/empty `spanID`, `field_kind`, `rule`, and `ts`, in addition to the ordinary logger envelope. They contain no matched values, attribute names, structural locations, catalog metadata, or metric-exposure classification.
 
+Resource and instrumentation-scope findings can refer to the traces that share those fields. Span-owned findings remain attached to their owning span, even when its trace or span ID is missing; Tempo does not attribute them to neighboring spans.
+
 Process metrics retain `tempo_secret_detections_total` by `attribute_scope`, `tempo_secret_detection_pushes_total` by `source_stream`, and the `tempo_secret_detection_duration_seconds` histogram by `source_stream`. Tenant remote-write metrics retain `traces_secret_detections_total` by `attribute_scope` and `source_stream`, and `traces_secret_detection_pushes_total` by `source_stream`. Detection totals count rule matches, not distinct credentials or emitted log records; pushes count batches presented to the detector. Policy update and compilation metrics remain available as described in the policy documentation.
 
 Finding logs are best-effort, with per-trace caps and per-tenant rate limits. Bounded `secret detection coverage gap` warnings retain a reason and safe tenant/trace/field context; input and delivery failures use existing error logs. Inspect these logs and generator lag when investigating gaps. Neither an absence of warnings nor a bounded Loki query proves a complete finding inventory.
 
-Finding logs are limited to 100 per second per tenant processor (burst 1,000), 1,000 per second process-wide (burst 2,000), and 1,000 per trace per request. These fixed limits discard excess log records without stopping scanning or detection counters.
+Finding logs are limited to 100 per second per tenant processor (burst 1,000), 1,000 per second process-wide (burst 2,000), and 1,000 per trace per request. Once a tenant or process rate limit rejects a finding, reporting stops for the remainder of that request, with at most one bounded rate-limit coverage warning. Later requests can report again as tokens become available. A per-trace cap suppresses only that trace, not other traces in the request. Scanning and detection counters continue even when reporting stops.
 
 Kafka keeps its normal automatic offset commits; it does not wait for secret detection to finish. A generator crash can therefore lose pending detections.
 

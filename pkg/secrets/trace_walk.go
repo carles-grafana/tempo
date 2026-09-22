@@ -22,6 +22,9 @@ const (
 type TraceLocation struct {
 	Resource int
 	Scope    int
+	// Span is -1 for resource/scope fields shared by their descendant spans.
+	// Nonnegative indices identify span-owned fields even when IDs are missing.
+	Span int
 }
 
 type TraceField struct {
@@ -46,7 +49,7 @@ func walkResourceSpans(resources []*tracev1.ResourceSpans, visit TraceFieldVisit
 		if resourceSpans == nil {
 			continue
 		}
-		base := TraceLocation{Resource: resourceIndex, Scope: -1}
+		base := TraceLocation{Resource: resourceIndex, Scope: -1, Span: -1}
 		if resourceSpans.SchemaUrl != "" && !visit(TraceField{Kind: FieldKindTraceField, Value: resourceSpans.SchemaUrl, Location: base}) {
 			return
 		}
@@ -87,10 +90,11 @@ func walkResourceSpans(resources []*tracev1.ResourceSpans, visit TraceFieldVisit
 					return
 				}
 			}
-			for _, span := range scopeSpans.Spans {
+			for spanIndex, span := range scopeSpans.Spans {
 				if span == nil {
 					continue
 				}
+				location.Span = spanIndex
 				if !walkSpan(span, location, visit) {
 					return
 				}

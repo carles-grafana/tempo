@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -90,7 +91,7 @@ func TestAppNewAppliesNativeRuleSelection(t *testing.T) {
 			config.Secrets = secrets.FeatureConfig{DetectionEnabled: true, EnabledRules: tc.ids}
 			app, err := New(*config)
 			require.NoError(t, err)
-			compiled, err := app.cfg.Generator.Processor.SecretDetection.PolicyCompiler.CompilePolicy(secrets.Policy{})
+			compiled, err := app.cfg.Generator.Processor.SecretDetection.PolicyCompiler.CompilePolicy(context.Background(), secrets.Policy{})
 			require.NoError(t, err)
 			require.ElementsMatch(t, tc.want, compiled.Detect("sk_test_"+"0123456789abcdefghijklmn"+"\n"+"xoxb-"+"1234567890-1234567890123-abcdefghijklmnopqrstuvwx").Matches)
 		})

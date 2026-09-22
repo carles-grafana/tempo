@@ -55,6 +55,11 @@ func (a *UserConfigOverridesAPI) GetHandler(w http.ResponseWriter, r *http.Reque
 
 	limits, version, err := a.get(ctx, userID)
 	if err != nil {
+		if errors.Is(err, client.ErrInvalidSecretsPolicy) {
+			// Keep this an error, including for merged scope. The version lets
+			// an authorized caller conditionally replace or delete the document.
+			w.Header().Set(headerEtag, string(version))
+		}
 		writeError(w, err)
 		return
 	}
@@ -102,6 +107,7 @@ func (a *UserConfigOverridesAPI) PostHandler(w http.ResponseWriter, r *http.Requ
 	version, err := a.set(ctx, userID, limits, backend.Version(ifMatchVersion), skipConflictingOverridesCheck)
 	if err != nil {
 		writeError(w, err)
+		return
 	}
 
 	w.Header().Set(headerEtag, string(version))
@@ -138,6 +144,9 @@ func (a *UserConfigOverridesAPI) PatchHandler(w http.ResponseWriter, r *http.Req
 	// Patch the parts of the overrides without calling GET first to obtain ETag for `If-Match`
 	patchedLimits, version, err := a.update(ctx, userID, patch, skipConflictingOverridesCheck)
 	if err != nil {
+		if errors.Is(err, client.ErrInvalidSecretsPolicy) {
+			w.Header().Set(headerEtag, string(version))
+		}
 		writeError(w, err)
 		return
 	}

@@ -194,9 +194,13 @@ Supported policy bounds are:
 
 Malformed regular expressions, duplicate or catalog-conflicting custom IDs, and over-budget policies are rejected as a whole. Unknown, malformed, or duplicate IDs in `disabled_rules` also reject the whole policy; wildcards and custom-rule IDs are not accepted. Errors do not echo submitted IDs or expressions. Existing instances keep their last-known-good policy, including its exclusions and custom rules. An invalid initial policy falls back to the operator-selected native baseline, with no tenant exclusions or custom rules, instead of preventing tenant initialization. A globally empty selection remains empty on fallback. Rejected exclusions are not applied partially. A restarted process has no previous compiled snapshot, so fallback can restore a selected rule that the invalid tenant policy intended to disable, but cannot expand the global selection. Repeated delivery of the same accepted or rejected policy does not repeatedly compile it.
 
+Runtime YAML isolates schema errors inside a tenant's secret-detection policy, including unsupported fields and incorrect value types, to that policy. Other tenants and ordinary override fields continue to load; the rejected policy follows the last-known-good or selected-native fallback above. Invalid YAML syntax and invalid ordinary override fields still reject the runtime file. Private policy content is suppressed before startup or reload parsing errors reach logs.
+
 Policies with 17 or more custom rules are rejected, not truncated. Reduce oversized policies in the administrator-owned configuration source. A newly started process with an oversized initial policy uses the selected native baseline without custom rules until a valid policy arrives.
 
 Custom rules are compiled into an immutable shared-candidate plan separate from the native catalog. Every tenant policy for a compiler shares its selected native catalog and matcher; a per-policy bitset skips tenant-excluded candidates before expensive evaluation. Native catalogs and matchers are not cloned for each tenant. Global exclusions avoid native compilation and matcher storage; tenant exclusions do not reclaim shared storage. Native validator expressions initialize once on first use. The same compiler is retained through generator processor replacement. No tenant or policy-revision cache is retained. At most two policy compilations run concurrently per process. Waiting updates re-read the latest effective override, and superseded builds cannot overwrite newer state. Every trace batch uses one complete policy snapshot and a cache bound to that snapshot.
+
+The user-configurable overrides API shares the two compilation slots with generator policy providers. Canceled requests stop waiting for admission; already-running regexp compilation holds its slot until it finishes, and its canceled result is discarded. Existing tenants can continue ingesting while another tenant's initial policy compiles.
 
 Removing a policy override restores inherited runtime/default policy, which may itself contain exclusions or custom rules; it does not change the processor list. An explicit `secret_detection: {}` replaces the inherited policy with the operator-selected native baseline and no custom rules. The effective policy replaces the inherited policy as a whole; lists do not merge. Within that policy, `disabled_rules: []` excludes no selected native rules and `custom_rules: []` enables no custom rules. Keep all intended exclusions and custom rules when replacing a policy; omitted exclusions restore selected native rules and omitted custom rules lose their coverage. Configure policies through runtime overrides or the existing user-configurable overrides API.
 
@@ -333,6 +337,12 @@ curl -X POST -H "X-Scope-OrgID: 3" -H "If-Match: 1697726795401423" http://localh
 ```
 
 If the version doesn't match the version in the backend, the request is rejected with HTTP error 412.
+
+### Repairing a rejected secret-detection policy
+
+When a stored document contains a rejected secret-detection policy, `GET` (including `scope=merged`) and `PATCH` return a value-free error with the stored object's `ETag`. `PATCH` leaves the document unchanged: it cannot safely reconstruct an unsupported policy.
+
+Use that `ETag` as `If-Match` on a full `POST` replacement, or on `DELETE` to remove the document. Build a complete supported replacement from your configuration source, including unrelated overrides you want to retain. On a version-enforcing backend, missing or stale versions cannot overwrite or delete the stored object; if another writer changes it, fetch the current version and retry. Repairing an existing rejected document does not trigger the conflicting-runtime-overrides check for new documents.
 
 ### Conflicting runtime overrides check
 

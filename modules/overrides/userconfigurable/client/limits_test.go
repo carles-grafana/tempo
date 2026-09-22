@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"encoding/json"
 	"reflect"
 	"testing"
@@ -220,7 +221,7 @@ func TestSecretDetectionDisabledRulesSerialization(t *testing.T) {
 					// An explicit empty policy must survive serialization, so
 					// it can still replace inherited exclusions/custom rules.
 					require.NotNil(t, policy)
-					compiled, err := compiler.CompilePolicy(*policy)
+					compiled, err := compiler.CompilePolicy(context.Background(), *policy)
 					require.NoError(t, err)
 					require.Equal(t, test.want, compiled.Detect(value+"\nCUSTOMER-123"))
 				}

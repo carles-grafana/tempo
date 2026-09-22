@@ -1,13 +1,14 @@
 package secrets
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
 
 func TestGenericFiltersPreserveSpecificAndCustomFindings(t *testing.T) {
-	policy, err := testPolicyCompiler.CompilePolicy(Policy{
+	policy, err := testPolicyCompiler.CompilePolicy(context.Background(), Policy{
 		CustomRules: []CustomRule{{
 			ID: "custom-generic", Regex: `(ghp_[A-Za-z0-9]{36})`,
 		}},

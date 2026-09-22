@@ -1,6 +1,7 @@
 package secrets
 
 import (
+	"context"
 	"slices"
 	"strings"
 	"testing"
@@ -69,7 +70,7 @@ func TestKeywordGuidancePreservesMixedByteContexts(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			test.rule.ID = "mixed-context-rule"
-			policy, err := testPolicyCompiler.CompilePolicy(Policy{CustomRules: []CustomRule{test.rule}})
+			policy, err := testPolicyCompiler.CompilePolicy(context.Background(), Policy{CustomRules: []CustomRule{test.rule}})
 			if err != nil {
 				t.Fatal("policy compilation failed")
 			}
@@ -91,7 +92,7 @@ func TestKeywordGuidancePreservesMixedByteContexts(t *testing.T) {
 }
 
 func TestKeywordGuidancePreservesUnicodeConsumingRules(t *testing.T) {
-	policy, err := testPolicyCompiler.CompilePolicy(Policy{CustomRules: []CustomRule{
+	policy, err := testPolicyCompiler.CompilePolicy(context.Background(), Policy{CustomRules: []CustomRule{
 		{ID: "folded", Regex: `FOLD:(?i:[a-z]{4})`},
 		{ID: "folded-prefix", Regex: `(?i)KEL_[A-Z]{4}`},
 		{ID: "wide", Regex: `WIDE:[^\n]{4}!`},
@@ -122,7 +123,7 @@ func TestKeywordGuidancePreservesUnicodeConsumingRules(t *testing.T) {
 }
 
 func TestKeywordGuidanceMixedInputOverflowAndReset(t *testing.T) {
-	policy, err := testPolicyCompiler.CompilePolicy(Policy{CustomRules: []CustomRule{{ID: "overflow", Regex: `\bTOK_[A-Z]{4}\b`}}})
+	policy, err := testPolicyCompiler.CompilePolicy(context.Background(), Policy{CustomRules: []CustomRule{{ID: "overflow", Regex: `\bTOK_[A-Z]{4}\b`}}})
 	if err != nil {
 		t.Fatal("policy compilation failed")
 	}

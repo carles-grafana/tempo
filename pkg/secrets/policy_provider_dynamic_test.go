@@ -50,7 +50,7 @@ func newDynamicTestProvider(source *dynamicPolicySource) (*compiledPolicyProvide
 		policy:    source.get,
 		logger:    log.NewNopLogger(),
 		updating:  make(chan struct{}, 1),
-		compile:   testPolicyCompiler.CompilePolicy,
+		compile:   testPolicyCompiler.compileAdmitted,
 		admission: make(chan struct{}, 2),
 		metrics:   newPolicyUpdateMetrics(registry),
 	}, registry
@@ -224,7 +224,7 @@ func TestDynamicInvalidDisabledRulesFailOpenAndRetainLastGood(t *testing.T) {
 				provider, _ := newDynamicTestProvider(source)
 				var logs bytes.Buffer
 				provider.logger = log.NewLogfmtLogger(&logs)
-				expected, err := testPolicyCompiler.CompilePolicy(Policy{})
+				expected, err := testPolicyCompiler.CompilePolicy(context.Background(), Policy{})
 				require.NoError(t, err)
 				want := Verdict{Matches: []Match{{RuleID: "generic-api-key"}}}
 				input := &Policy{DisabledRules: []string{"generic-api-key"}}
@@ -318,7 +318,7 @@ func TestDynamicPolicyRejectsOnceRetainsSnapshotAndRecovers(t *testing.T) {
 		if policy.CustomRules[0].Regex == "(" {
 			return nil, errors.New(unsafeError)
 		}
-		return testPolicyCompiler.CompilePolicy(policy)
+		return testPolicyCompiler.compileAdmitted(policy)
 	}
 	accepted, ok := provider.current(context.Background())
 	require.True(t, ok)
@@ -396,7 +396,7 @@ func TestDynamicPolicyInitialFallbackDiscardsSupersededOverride(t *testing.T) {
 			close(started)
 			<-release
 		}
-		return testPolicyCompiler.CompilePolicy(policy)
+		return testPolicyCompiler.compileAdmitted(policy)
 	}
 	pending := refreshDynamicPolicy(context.Background(), provider)
 	awaitDynamic(t, started)
@@ -426,7 +426,7 @@ func TestDynamicPolicyDiscardsStaleCompilationAndCoalescesCallers(t *testing.T) 
 			close(started)
 			<-release
 		}
-		return testPolicyCompiler.CompilePolicy(policy)
+		return testPolicyCompiler.compileAdmitted(policy)
 	}
 	source.set(dynamicPolicy("DYNAMIC-TWO"), false)
 	first := refreshDynamicPolicy(context.Background(), provider)
@@ -460,7 +460,7 @@ func TestDynamicPolicyRereadsAfterAdmissionWait(t *testing.T) {
 	var compiledInputs []string
 	provider.compile = func(policy Policy) (*CompiledPolicy, error) {
 		compiledInputs = append(compiledInputs, policy.CustomRules[0].Regex)
-		return testPolicyCompiler.CompilePolicy(policy)
+		return testPolicyCompiler.compileAdmitted(policy)
 	}
 	source.set(dynamicPolicy("DYNAMIC-TWO"), false)
 	pending := refreshDynamicPolicy(waiting, provider)
@@ -505,7 +505,7 @@ func TestDynamicPolicyCancellationReleasesWaitersWithoutPublishing(t *testing.T)
 				provider.compile = func(policy Policy) (*CompiledPolicy, error) {
 					close(started)
 					<-release
-					return testPolicyCompiler.CompilePolicy(policy)
+					return testPolicyCompiler.compileAdmitted(policy)
 				}
 				unblock = sync.OnceFunc(func() { close(release) })
 			}
@@ -523,7 +523,7 @@ func TestDynamicPolicyCancellationReleasesWaitersWithoutPublishing(t *testing.T)
 			assert.Equal(t, 1.0, testutil.ToFloat64(provider.metrics.canceled))
 			assert.Equal(t, 0.0, testutil.ToFloat64(provider.metrics.active))
 			unblock()
-			provider.compile = testPolicyCompiler.CompilePolicy
+			provider.compile = testPolicyCompiler.compileAdmitted
 			recovered, ok := provider.current(context.Background())
 			require.True(t, ok)
 			assert.True(t, recovered.Detect("DYNAMIC-TWO").Matched())
@@ -565,7 +565,7 @@ func TestDynamicPolicyProcessWideCompilationBound(t *testing.T) {
 			provider.compile = func(policy Policy) (*CompiledPolicy, error) {
 				started <- struct{}{}
 				<-release
-				return testPolicyCompiler.CompilePolicy(policy)
+				return testPolicyCompiler.compileAdmitted(policy)
 			}
 			results = append(results, refreshDynamicPolicy(context.Background(), provider))
 		}
@@ -588,5 +588,97 @@ func TestDynamicPolicyProcessWideCompilationBound(t *testing.T) {
 		}
 		assert.Equal(t, 0.0, testutil.ToFloat64(metrics.active))
 		assert.Equal(t, float64(contenders), testutil.ToFloat64(metrics.applied))
+	})
+}
+
+func TestPolicyCompilationSharesAdmissionWithProviders(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// Exercise factory-created providers and the public compilation API
+		// against the same production admission, isolated to this bubble.
+		oldSlots, oldMetrics := policyCompilationSlots, policyUpdates
+		policyCompilationSlots = make(chan struct{}, 2)
+		policyUpdates = newPolicyUpdateMetrics(prometheus.NewRegistry())
+		defer func() { policyCompilationSlots, policyUpdates = oldSlots, oldMetrics }()
+
+		started := make(chan string, 8)
+		newBlockedCompiler := func(name string) (*PolicyCompiler, func()) {
+			compiler, err := NewPolicyCompiler(&[]string{})
+			require.NoError(t, err)
+			catalog := compiler.catalog
+			release := make(chan struct{})
+			unblock := sync.OnceFunc(func() { close(release) })
+			compiler.catalog = func() (*compiledCatalog, error) {
+				started <- name
+				<-release
+				return catalog()
+			}
+			return compiler, unblock
+		}
+		type compileResult struct {
+			policy *CompiledPolicy
+			err    error
+		}
+		compile := func(ctx context.Context, compiler *PolicyCompiler) <-chan compileResult {
+			result := make(chan compileResult, 1)
+			go func() {
+				policy, err := compiler.CompilePolicy(ctx, *dynamicPolicy("DIRECT"))
+				result <- compileResult{policy, err}
+			}()
+			return result
+		}
+
+		directCompiler, releaseDirect := newBlockedCompiler("direct")
+		defer releaseDirect()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		direct := compile(ctx, directCompiler)
+		providerCompiler, releaseProvider := newBlockedCompiler("provider")
+		defer releaseProvider()
+		source := &dynamicPolicySource{}
+		source.set(dynamicPolicy("OLD"), false)
+		provider := providerCompiler.NewCompiledPolicyProvider("tenant", source.get, log.NewNopLogger())
+		providerResult := make(chan dynamicPolicyResult, 1)
+		go func() {
+			policy, ok := provider(context.Background())
+			providerResult <- dynamicPolicyResult{policy, ok}
+		}()
+		synctest.Wait()
+		require.Len(t, started, 2)
+		require.Equal(t, 2.0, testutil.ToFloat64(policyUpdates.active))
+
+		waitingCtx, cancelWaiting := context.WithCancel(context.Background())
+		defer cancelWaiting()
+		waiting := compile(waitingCtx, directCompiler)
+		synctest.Wait()
+		require.Len(t, started, 2, "direct and provider work must share the two slots")
+		cancelWaiting()
+		waited := <-waiting
+		require.ErrorIs(t, waited.err, context.Canceled)
+		require.Nil(t, waited.policy)
+		require.Len(t, started, 2, "cancellation while waiting must not compile")
+
+		cancel()
+		synctest.Wait()
+		require.Empty(t, direct, "non-interruptible compilation must finish before releasing admission")
+		require.Equal(t, 2.0, testutil.ToFloat64(policyUpdates.active))
+		releaseDirect()
+		canceled := <-direct
+		require.ErrorIs(t, canceled.err, context.Canceled)
+		require.Nil(t, canceled.policy)
+		require.Equal(t, 1.0, testutil.ToFloat64(policyUpdates.active))
+
+		// A released direct slot must be available even while a provider is
+		// compiling; the provider must not hold or acquire a second slot.
+		recovered := <-compile(context.Background(), directCompiler)
+		require.NoError(t, recovered.err)
+		require.True(t, recovered.policy.Detect("DIRECT").Matched())
+		source.set(dynamicPolicy("LATEST"), false)
+		releaseProvider()
+		current := <-providerResult
+		require.True(t, current.ok)
+		require.False(t, current.policy.Detect("OLD").Matched())
+		require.True(t, current.policy.Detect("LATEST").Matched())
+		require.Equal(t, 1.0, testutil.ToFloat64(policyUpdates.superseded))
+		require.Zero(t, testutil.ToFloat64(policyUpdates.active))
 	})
 }

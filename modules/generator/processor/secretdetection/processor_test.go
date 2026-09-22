@@ -18,6 +18,7 @@ import (
 
 	"github.com/grafana/tempo/modules/generator/processor"
 	"github.com/grafana/tempo/modules/generator/registry"
+	"github.com/grafana/tempo/pkg/ingest"
 	"github.com/grafana/tempo/pkg/secrets"
 	"github.com/grafana/tempo/pkg/tempopb"
 	common_v1 "github.com/grafana/tempo/pkg/tempopb/common/v1"
@@ -365,22 +366,6 @@ func TestLogOutputContainsExpectedFields(t *testing.T) {
 	}}, logger.Entries())
 }
 
-func TestTraceFindingStatesPreserveInlineStateWhenGrowing(t *testing.T) {
-	var states traceFindingStates
-	field := secrets.TraceField{}
-	for index := range 10 {
-		traceID := make([]byte, 16)
-		traceID[15] = byte(index)
-		states.stateFor(traceID, field).findingLogs = index + 1
-	}
-
-	for index := range 10 {
-		traceID := make([]byte, 16)
-		traceID[15] = byte(index)
-		assert.Equal(t, index+1, states.stateFor(traceID, field).findingLogs)
-	}
-}
-
 func TestDetectionScansBeyondFormerPerTraceCeilings(t *testing.T) {
 	assertFindingAfter := func(t *testing.T, attributes []*common_v1.KeyValue) {
 		t.Helper()
@@ -434,37 +419,47 @@ func TestFindingLogLimitIsIsolatedPerTrace(t *testing.T) {
 	for index := range firstAttributes {
 		firstAttributes[index] = test.MakeAttribute(fmt.Sprintf("field.%d", index), fakeSlackToken())
 	}
+	spans := []*trace_v1.Span{{TraceId: []byte{1}, SpanId: []byte{1}, Attributes: firstAttributes}}
+	for traceID := byte(2); traceID <= 10; traceID++ {
+		spans = append(spans, &trace_v1.Span{
+			TraceId: []byte{traceID}, SpanId: []byte{traceID},
+			Attributes: []*common_v1.KeyValue{test.MakeAttribute("slack.token", fakeSlackToken())},
+		})
+	}
+	// Revisit the capped trace after enough other traces to grow state storage.
+	spans = append(spans, &trace_v1.Span{
+		TraceId: []byte{1}, SpanId: []byte{11},
+		Attributes: []*common_v1.KeyValue{test.MakeAttribute("slack.token", fakeSlackToken())},
+	})
 	request := &tempopb.PushSpansRequest{Batches: []*trace_v1.ResourceSpans{{
-		Resource: &resource_v1.Resource{},
-		ScopeSpans: []*trace_v1.ScopeSpans{{Spans: []*trace_v1.Span{
-			{TraceId: []byte{1}, SpanId: []byte{1}, Attributes: firstAttributes},
-			{TraceId: []byte{2}, SpanId: []byte{2}, Attributes: []*common_v1.KeyValue{
-				test.MakeAttribute("slack.token", fakeSlackToken()),
-			}},
-		}}},
+		ScopeSpans: []*trace_v1.ScopeSpans{{Spans: spans}},
 	}}}
 
 	p.PushSpans(context.Background(), request)
 
-	firstFindings := 0
-	var firstLimitGap, secondFinding bool
+	findingsByTrace := map[string]int{}
+	gaps := 0
 	for _, entry := range logger.Entries() {
-		if entry["msg"] == "secret detected in trace field" && entry["traceID"] == "01" {
-			firstFindings++
+		if entry["rule"] != "" {
+			findingsByTrace[entry["traceID"]]++
 		}
-		firstLimitGap = firstLimitGap || entry["reason"] == "finding_log_limit_exceeded" && entry["traceID"] == "01"
-		secondFinding = secondFinding || entry["msg"] == "secret detected in trace field" && entry["traceID"] == "02"
+		if entry["reason"] == "finding_log_limit_exceeded" {
+			assert.Equal(t, "01", entry["traceID"])
+			gaps++
+		}
 	}
-	assert.Equal(t, maxFindingLogsPerTrace, firstFindings)
-	assert.True(t, firstLimitGap)
-	assert.True(t, secondFinding)
+	assert.Equal(t, maxFindingLogsPerTrace, findingsByTrace["01"])
+	for traceID := 2; traceID <= 10; traceID++ {
+		assert.Equal(t, 1, findingsByTrace[fmt.Sprintf("%02x", traceID)])
+	}
+	assert.Equal(t, 1, gaps)
 }
 
 func newConfiguredProcessor(t *testing.T, policy secrets.Policy, logger *capturingLogger) *Processor {
 	t.Helper()
 	compiler, err := secrets.NewPolicyCompiler(nil)
 	require.NoError(t, err)
-	compiled, err := compiler.CompilePolicy(policy)
+	compiled, err := compiler.CompilePolicy(context.Background(), policy)
 	require.NoError(t, err)
 	p, err := New(Config{CompiledPolicy: compiled}, "test-tenant", level.Warn(logger), nil)
 	require.NoError(t, err)
@@ -609,31 +604,40 @@ func TestFindingLogRateLimitReportsDegradedCoverage(t *testing.T) {
 }
 
 func TestFindingLogProcessLimitIsSharedAcrossProcessors(t *testing.T) {
+	// These tests are serial: isolate the process budget before construction,
+	// leaving each constructor-selected limiter untouched.
+	oldFinding, oldCoverage := sharedFindingLogLimiter, sharedCoverageLogLimiter
+	sharedFindingLogLimiter = rate.NewLimiter(0, 1)
+	sharedCoverageLogLimiter = rate.NewLimiter(rate.Inf, 0)
+	t.Cleanup(func() {
+		sharedFindingLogLimiter, sharedCoverageLogLimiter = oldFinding, oldCoverage
+	})
+
 	firstLogger := &capturingLogger{}
 	first, err := New(Config{}, "first-tenant", firstLogger, nil)
 	require.NoError(t, err)
-	first.logFinding = firstLogger.Log
-	first.findingLogLimiter = rate.NewLimiter(rate.Inf, 0)
 	secondLogger := &capturingLogger{}
 	second, err := New(Config{}, "second-tenant", secondLogger, nil)
 	require.NoError(t, err)
-	second.logFinding = secondLogger.Log
-	second.findingLogLimiter = rate.NewLimiter(rate.Inf, 0)
-	first.processCoverageLogLimiter = rate.NewLimiter(rate.Inf, 0)
-	second.processCoverageLogLimiter = rate.NewLimiter(rate.Inf, 0)
 
-	limiter := rate.NewLimiter(0, 1)
-	first.processFindingLogLimiter = limiter
-	second.processFindingLogLimiter = limiter
 	first.PushSpans(context.Background(), spanAttrReq([2]string{"authorization", fakeSlackToken()}))
 	second.PushSpans(context.Background(), spanAttrReq([2]string{"authorization", fakeSlackToken()}))
 
-	assert.Len(t, firstLogger.Entries(), 1)
+	require.Len(t, firstLogger.Entries(), 1)
+	assert.Equal(t, "slack-bot-token", firstLogger.Entries()[0]["rule"])
 	require.Len(t, secondLogger.Entries(), 1)
+	assert.Empty(t, secondLogger.Entries()[0]["rule"])
 	assert.Equal(t, "finding_log_rate_limit_exceeded", secondLogger.Entries()[0]["reason"])
 }
 
 func TestCoverageLogProcessLimitIsSharedAcrossProcessors(t *testing.T) {
+	oldFinding, oldCoverage := sharedFindingLogLimiter, sharedCoverageLogLimiter
+	sharedFindingLogLimiter = rate.NewLimiter(rate.Inf, 0)
+	sharedCoverageLogLimiter = rate.NewLimiter(0, 1)
+	t.Cleanup(func() {
+		sharedFindingLogLimiter, sharedCoverageLogLimiter = oldFinding, oldCoverage
+	})
+
 	firstLogger := &capturingLogger{}
 	first, err := New(Config{}, "first-tenant", firstLogger, nil)
 	require.NoError(t, err)
@@ -641,17 +645,16 @@ func TestCoverageLogProcessLimitIsSharedAcrossProcessors(t *testing.T) {
 	second, err := New(Config{}, "second-tenant", secondLogger, nil)
 	require.NoError(t, err)
 
-	limiter := rate.NewLimiter(0, 1)
-	first.processCoverageLogLimiter = limiter
-	second.processCoverageLogLimiter = limiter
 	first.findingLogLimiter = rate.NewLimiter(0, 0)
 	second.findingLogLimiter = rate.NewLimiter(0, 0)
+	detectionsBefore := testutil.ToFloat64(metricSecretDetectionsTotal.WithLabelValues(scopeSpan))
 	first.PushSpans(context.Background(), spanAttrReq([2]string{"authorization", fakeSlackToken()}))
 	second.PushSpans(context.Background(), spanAttrReq([2]string{"authorization", fakeSlackToken()}))
 
 	require.Len(t, firstLogger.Entries(), 1)
 	assert.Equal(t, "finding_log_rate_limit_exceeded", firstLogger.Entries()[0]["reason"])
 	assert.Empty(t, secondLogger.Entries())
+	assert.Equal(t, detectionsBefore+2, testutil.ToFloat64(metricSecretDetectionsTotal.WithLabelValues(scopeSpan)))
 }
 
 func TestTenantMetricsCountRuleFieldMatchesAndBatches(t *testing.T) {
@@ -659,7 +662,7 @@ func TestTenantMetricsCountRuleFieldMatchesAndBatches(t *testing.T) {
 	tenantMetrics := NewTenantMetrics(testRegistry, "sampler-ingest")
 	compiler, err := secrets.NewPolicyCompiler(&[]string{})
 	require.NoError(t, err)
-	compiled, err := compiler.CompilePolicy(secrets.Policy{CustomRules: []secrets.CustomRule{
+	compiled, err := compiler.CompilePolicy(context.Background(), secrets.Policy{CustomRules: []secrets.CustomRule{
 		{ID: "first-rule", Regex: `CUSTOMER-[0-9]+`},
 		{ID: "second-rule", Regex: `CUSTOMER-[0-9]+`},
 	}})
@@ -737,4 +740,198 @@ func TestPushSpansObservesCompletedScanDuration(t *testing.T) {
 	p.PushSpans(context.Background(), &tempopb.PushSpansRequest{})
 
 	assert.Equal(t, 2.0, duration.value)
+}
+
+func TestOTLPSpanFieldsWithoutTraceIDDoNotImplicateSibling(t *testing.T) {
+	compiler, err := secrets.NewPolicyCompiler(&[]string{})
+	require.NoError(t, err)
+	compiled, err := compiler.CompilePolicy(context.Background(), secrets.Policy{CustomRules: []secrets.CustomRule{
+		{ID: "owned-rule", Regex: `OWNED-[0-9]+`},
+		{ID: "shared-rule", Regex: `SHARED-[0-9]+`},
+	}})
+	require.NoError(t, err)
+	logger := &capturingLogger{}
+	p, err := New(Config{CompiledPolicy: compiled}, "otlp-tenant", logger, nil)
+	require.NoError(t, err)
+	p.findingLogLimiter = rate.NewLimiter(rate.Inf, 0)
+	p.processFindingLogLimiter = rate.NewLimiter(rate.Inf, 0)
+
+	const owned = "OWNED-123"
+	const cleanTraceID = "0102030405060708090a0b0c0d0e0f10"
+	request := decodeOTLPRequest(t, []*trace_v1.ResourceSpans{{
+		SchemaUrl: "SHARED-123",
+		ScopeSpans: []*trace_v1.ScopeSpans{{
+			Scope: &common_v1.InstrumentationScope{Name: "SHARED-123"},
+			Spans: []*trace_v1.Span{
+				{
+					// Both IDs are absent in this raw OTLP span.
+					Name: owned, TraceState: owned,
+					Status:     &trace_v1.Status{Message: owned},
+					Attributes: []*common_v1.KeyValue{test.MakeAttribute("span", owned)},
+					Events: []*trace_v1.Span_Event{{
+						Name: owned, Attributes: []*common_v1.KeyValue{test.MakeAttribute("event", owned)},
+					}},
+					Links: []*trace_v1.Span_Link{{
+						TraceId: []byte{42}, TraceState: owned,
+						Attributes: []*common_v1.KeyValue{test.MakeAttribute("link", owned)},
+					}},
+				},
+				{TraceId: []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}, Name: "clean"},
+			},
+		}},
+	}})
+
+	p.PushSpans(context.Background(), request)
+
+	ownedFindings, sharedFindings := 0, 0
+	for _, entry := range logger.Entries() {
+		switch entry["rule"] {
+		case "owned-rule":
+			ownedFindings++
+			assert.Empty(t, entry["traceID"], "a missing owner ID must stay unattributed")
+			assert.Empty(t, entry["spanID"])
+		case "shared-rule":
+			sharedFindings++
+			assert.Equal(t, cleanTraceID, entry["traceID"], "shared metadata still belongs to descendant traces")
+			assert.Empty(t, entry["spanID"])
+		default:
+			t.Fatalf("unexpected reporting entry: %v", entry)
+		}
+	}
+	assert.Equal(t, 8, ownedFindings)
+	assert.Equal(t, 2, sharedFindings)
+}
+
+func TestOTLPSharedFieldReportingStopsAfterRateLimit(t *testing.T) {
+	const (
+		fieldCount = 4096
+		traceCount = 1024
+		logBudget  = 3
+	)
+	compiler, err := secrets.NewPolicyCompiler(&[]string{})
+	require.NoError(t, err)
+	compiled, err := compiler.CompilePolicy(context.Background(), secrets.Policy{CustomRules: []secrets.CustomRule{
+		{ID: "first-rule", Regex: `CUSTOMER-[0-9]+`},
+		{ID: "second-rule", Regex: `CUSTOMER-[0-9]+`},
+		{ID: "after-rule", Regex: `AFTER-[0-9]+`},
+	}})
+	require.NoError(t, err)
+	logger := &capturingLogger{}
+	testRegistry := registry.NewTestRegistry()
+	p, err := New(Config{CompiledPolicy: compiled}, "otlp-tenant", logger, NewTenantMetrics(testRegistry, "otlp"))
+	require.NoError(t, err)
+	p.findingLogLimiter = rate.NewLimiter(rate.Inf, 0)
+	p.processFindingLogLimiter = rate.NewLimiter(0, logBudget)
+	p.coverageLogLimiter = rate.NewLimiter(rate.Inf, 0)
+	p.processCoverageLogLimiter = rate.NewLimiter(rate.Inf, 0)
+	resourceBefore := testutil.ToFloat64(metricSecretDetectionsTotal.WithLabelValues(scopeResource))
+	scopeBefore := testutil.ToFloat64(metricSecretDetectionsTotal.WithLabelValues(scopeScope))
+	spanBefore := testutil.ToFloat64(metricSecretDetectionsTotal.WithLabelValues(scopeSpan))
+
+	p.PushSpans(context.Background(), sharedOTLPRequest(t, fieldCount, traceCount))
+
+	findings, gaps := 0, 0
+	for _, entry := range logger.Entries() {
+		if entry["rule"] != "" {
+			findings++
+		} else {
+			gaps++
+			assert.Equal(t, "finding_log_rate_limit_exceeded", entry["reason"])
+			assert.Equal(t, string(secrets.FieldKindResourceAttribute), entry["field_kind"])
+			assert.Len(t, entry["traceID"], 32)
+		}
+	}
+	assert.Equal(t, logBudget, findings)
+	assert.Equal(t, 1, gaps, "one representative gap bounds diagnostics, not one per suppressed trace")
+	assert.Equal(t, resourceBefore+2*fieldCount, testutil.ToFloat64(metricSecretDetectionsTotal.WithLabelValues(scopeResource)))
+	assert.Equal(t, scopeBefore+2*fieldCount, testutil.ToFloat64(metricSecretDetectionsTotal.WithLabelValues(scopeScope)))
+	assert.Equal(t, spanBefore+1, testutil.ToFloat64(metricSecretDetectionsTotal.WithLabelValues(scopeSpan)))
+	assert.Equal(t, float64(2*fieldCount), testRegistry.Query(tenantMetricDetections, labels.FromStrings("attribute_scope", scopeResource, "source_stream", "otlp")))
+	assert.Equal(t, float64(2*fieldCount), testRegistry.Query(tenantMetricDetections, labels.FromStrings("attribute_scope", scopeScope, "source_stream", "otlp")))
+	assert.Equal(t, 1.0, testRegistry.Query(tenantMetricDetections, labels.FromStrings("attribute_scope", scopeSpan, "source_stream", "otlp")))
+}
+
+func TestOTLPSharedFindingLimitLeavesOtherScopesReportable(t *testing.T) {
+	logger := &capturingLogger{}
+	p := newConfiguredProcessor(t, secrets.Policy{CustomRules: []secrets.CustomRule{
+		{ID: "shared-rule", Regex: `CUSTOMER-[0-9]+`},
+	}}, logger)
+	values := make([]*common_v1.AnyValue, maxFindingLogsPerTrace+100)
+	for i := range values {
+		values[i] = &common_v1.AnyValue{Value: &common_v1.AnyValue_StringValue{StringValue: "CUSTOMER-123"}}
+	}
+	request := decodeOTLPRequest(t, []*trace_v1.ResourceSpans{{ScopeSpans: []*trace_v1.ScopeSpans{
+		{
+			Scope: &common_v1.InstrumentationScope{Attributes: []*common_v1.KeyValue{{
+				Key: "values", Value: &common_v1.AnyValue{Value: &common_v1.AnyValue_ArrayValue{
+					ArrayValue: &common_v1.ArrayValue{Values: values},
+				}},
+			}}},
+			Spans: []*trace_v1.Span{{TraceId: []byte{1}}},
+		},
+		{
+			Scope: &common_v1.InstrumentationScope{Attributes: []*common_v1.KeyValue{test.MakeAttribute("value", "CUSTOMER-123")}},
+			Spans: []*trace_v1.Span{{TraceId: []byte{2}}},
+		},
+	}}})
+	detectionsBefore := testutil.ToFloat64(metricSecretDetectionsTotal.WithLabelValues(scopeScope))
+
+	p.PushSpans(context.Background(), request)
+
+	findings := map[string]int{}
+	gaps := 0
+	for _, entry := range logger.Entries() {
+		if entry["rule"] == "shared-rule" {
+			findings[entry["traceID"]]++
+		}
+		if entry["reason"] == "finding_log_limit_exceeded" {
+			gaps++
+			assert.Equal(t, "01", entry["traceID"])
+		}
+	}
+	assert.Equal(t, map[string]int{"01": maxFindingLogsPerTrace, "02": 1}, findings)
+	assert.Equal(t, 1, gaps)
+	assert.Equal(t, detectionsBefore+float64(len(values)+1), testutil.ToFloat64(metricSecretDetectionsTotal.WithLabelValues(scopeScope)))
+}
+
+func decodeOTLPRequest(t testing.TB, resources []*trace_v1.ResourceSpans) *tempopb.PushSpansRequest {
+	t.Helper()
+	trace := tempopb.Trace{ResourceSpans: resources}
+	data, err := trace.Marshal()
+	require.NoError(t, err)
+	requests, err := ingest.NewOTLPDecoder().Decode(data)
+	require.NoError(t, err)
+	for request, err := range requests {
+		require.NoError(t, err)
+		return request
+	}
+	t.Fatal("OTLP decoder did not yield a request")
+	return nil
+}
+
+func sharedOTLPRequest(t testing.TB, fieldCount, traceCount int) *tempopb.PushSpansRequest {
+	t.Helper()
+	values := make([]*common_v1.AnyValue, fieldCount)
+	for i := range values {
+		values[i] = &common_v1.AnyValue{Value: &common_v1.AnyValue_StringValue{StringValue: "CUSTOMER-123"}}
+	}
+	attribute := &common_v1.KeyValue{
+		Key: "values", Value: &common_v1.AnyValue{Value: &common_v1.AnyValue_ArrayValue{
+			ArrayValue: &common_v1.ArrayValue{Values: values},
+		}},
+	}
+	spans := make([]*trace_v1.Span, traceCount)
+	for i := range spans {
+		traceID := make([]byte, 16)
+		traceID[12], traceID[13], traceID[14], traceID[15] = byte((i+1)>>24), byte((i+1)>>16), byte((i+1)>>8), byte(i+1)
+		spans[i] = &trace_v1.Span{TraceId: traceID}
+	}
+	spans[len(spans)-1].Attributes = []*common_v1.KeyValue{test.MakeAttribute("after", "AFTER-123")}
+	return decodeOTLPRequest(t, []*trace_v1.ResourceSpans{{
+		Resource: &resource_v1.Resource{Attributes: []*common_v1.KeyValue{attribute}},
+		ScopeSpans: []*trace_v1.ScopeSpans{{
+			Scope: &common_v1.InstrumentationScope{Attributes: []*common_v1.KeyValue{attribute}},
+			Spans: spans,
+		}},
+	}})
 }

@@ -1,22 +1,31 @@
 package app
 
 import (
+	"bytes"
+	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/grafana/dskit/services"
+	"github.com/grafana/dskit/user"
 	"github.com/grafana/tempo/modules/distributor"
 	"github.com/grafana/tempo/modules/distributor/forwarder"
 	"github.com/grafana/tempo/modules/generator/processor"
 	"github.com/grafana/tempo/modules/generator/validation"
 	"github.com/grafana/tempo/modules/overrides"
 	"github.com/grafana/tempo/modules/overrides/histograms"
+	overridesapi "github.com/grafana/tempo/modules/overrides/userconfigurable/api"
 	"github.com/grafana/tempo/modules/overrides/userconfigurable/client"
 	"github.com/grafana/tempo/pkg/secrets"
 	"github.com/grafana/tempo/pkg/sharedconfig"
 	filterconfig "github.com/grafana/tempo/pkg/spanfilter/config"
 	"github.com/grafana/tempo/pkg/util/listtomap"
 	"github.com/grafana/tempo/tempodb/backend"
+	"github.com/grafana/tempo/tempodb/backend/local"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -865,7 +874,7 @@ func Test_overridesValidator(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			validator := newOverridesValidator(&tc.cfg)
 
-			err := validator.Validate(&tc.limits)
+			err := validator.Validate(context.Background(), &tc.limits)
 			if tc.expErr != "" {
 				assert.EqualError(t, err, tc.expErr)
 			} else {
@@ -885,7 +894,7 @@ func TestOverridesValidatorRejectsUnsafePolicyWithoutEchoingInput(t *testing.T) 
 			SecretDetection: &secrets.Policy{CustomRules: []secrets.CustomRule{{ID: privateID, Regex: privatePattern}}},
 		},
 	}}
-	err := validator.Validate(limits)
+	err := validator.Validate(context.Background(), limits)
 	require.Error(t, err)
 	require.NotContains(t, err.Error(), privateID)
 	require.NotContains(t, err.Error(), privatePattern)
@@ -893,7 +902,49 @@ func TestOverridesValidatorRejectsUnsafePolicyWithoutEchoingInput(t *testing.T) 
 	// Globally inactive native IDs remain valid tenant exclusions, but cannot
 	// be reused as custom IDs even with an empty global selection.
 	limits.MetricsGenerator.Processor.SecretDetection = &secrets.Policy{DisabledRules: []string{"stripe-access-token"}}
-	require.NoError(t, validator.Validate(limits))
+	require.NoError(t, validator.Validate(context.Background(), limits))
 	limits.MetricsGenerator.Processor.SecretDetection.CustomRules = []secrets.CustomRule{{ID: "stripe-access-token", Regex: "CUSTOM"}}
-	require.Error(t, validator.Validate(limits))
+	require.Error(t, validator.Validate(context.Background(), limits))
+}
+
+func TestOverridesAPICanceledValidationDoesNotPersistPolicy(t *testing.T) {
+	compiler, err := secrets.NewPolicyCompiler(&[]string{})
+	require.NoError(t, err)
+	cfg := NewDefaultConfig()
+	cfg.Generator.Processor.SecretDetection.PolicyCompiler = compiler
+	storeCfg := &client.Config{Backend: backend.Local, Local: &local.Config{Path: t.TempDir()}}
+	runtimeOverrides, err := overrides.NewOverrides(overrides.Config{}, nil, prometheus.NewRegistry())
+	require.NoError(t, err)
+	a, err := overridesapi.New(&overrides.UserConfigurableOverridesAPIConfig{}, storeCfg, runtimeOverrides, newOverridesValidator(cfg))
+	require.NoError(t, err)
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), a))
+	t.Cleanup(func() {
+		require.NoError(t, services.StopAndAwaitTerminated(context.Background(), a))
+	})
+	store, err := client.New(storeCfg)
+	require.NoError(t, err)
+	t.Cleanup(store.Shutdown)
+	body := []byte(`{"metrics_generator":{"processor":{"secret_detection":{"custom_rules":[{"id":"tenant-token","regex":"TENANT-TOKEN"}]}}}}`)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	request := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+	request.Header.Set("If-Match", string(backend.VersionNew))
+	request = request.WithContext(user.InjectOrgID(ctx, "api-tenant"))
+	canceled := httptest.NewRecorder()
+	a.PostHandler(canceled, request)
+	require.Equal(t, http.StatusBadRequest, canceled.Code)
+	_, _, err = store.Get(context.Background(), "api-tenant")
+	require.ErrorIs(t, err, backend.ErrDoesNotExist, "canceled validation must not persist limits")
+
+	request = httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+	request.Header.Set("If-Match", string(backend.VersionNew))
+	request = request.WithContext(user.InjectOrgID(request.Context(), "api-tenant"))
+	accepted := httptest.NewRecorder()
+	a.PostHandler(accepted, request)
+	require.Equal(t, http.StatusOK, accepted.Code)
+	limits, _, err := store.Get(context.Background(), "api-tenant")
+	require.NoError(t, err)
+	compiled, err := compiler.CompilePolicy(context.Background(), *limits.MetricsGenerator.Processor.SecretDetection)
+	require.NoError(t, err)
+	require.Equal(t, []secrets.Match{{RuleID: "tenant-token"}}, compiled.Detect("TENANT-TOKEN").Matches)
 }

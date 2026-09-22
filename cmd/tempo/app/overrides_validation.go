@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
@@ -103,7 +104,7 @@ func newOverridesValidator(cfg *Config) api.Validator {
 }
 
 // Validate validates user-configurable overrides
-func (v *overridesValidator) Validate(limits *client.Limits) error {
+func (v *overridesValidator) Validate(ctx context.Context, limits *client.Limits) error {
 	if forwarders, ok := limits.GetForwarders(); ok {
 		for _, f := range forwarders {
 			if _, ok := v.validForwarders[f]; !ok {
@@ -225,7 +226,7 @@ func (v *overridesValidator) Validate(limits *client.Limits) error {
 		if err != nil {
 			return fmt.Errorf("invalid secrets configuration: %w", err)
 		}
-		if _, err := compiler.CompilePolicy(*policy); err != nil {
+		if _, err := compiler.CompilePolicy(ctx, *policy); err != nil {
 			return fmt.Errorf("invalid metrics_generator.processor.secret_detection: %w", err)
 		}
 	}

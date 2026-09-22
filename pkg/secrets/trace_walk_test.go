@@ -82,6 +82,34 @@ func TestWalkPushSpansRequestStopsWhenVisitorRejectsField(t *testing.T) {
 	assert.Equal(t, 1, visits)
 }
 
+func TestWalkPushSpansRequestPreservesOwnershipWithoutIDs(t *testing.T) {
+	request := &tempopb.PushSpansRequest{Batches: []*tracev1.ResourceSpans{{
+		SchemaUrl: "resource",
+		ScopeSpans: []*tracev1.ScopeSpans{{
+			SchemaUrl: "scope",
+			Spans: []*tracev1.Span{nil, {
+				Name:       "span",
+				Attributes: []*commonv1.KeyValue{{Value: arrayValue(kvValue("key", "nested"))}},
+				Events:     []*tracev1.Span_Event{{Name: "event"}},
+				Links:      []*tracev1.Span_Link{{TraceId: []byte{1}, TraceState: "link"}},
+			}},
+		}},
+	}}}
+	locations := map[string]TraceLocation{}
+	WalkPushSpansRequest(request, func(field TraceField) bool {
+		locations[field.Value] = field.Location
+		return true
+	})
+	assert.Equal(t, map[string]TraceLocation{
+		"resource": {Resource: 0, Scope: -1, Span: -1},
+		"scope":    {Resource: 0, Scope: 0, Span: -1},
+		"span":     {Resource: 0, Scope: 0, Span: 1},
+		"nested":   {Resource: 0, Scope: 0, Span: 1},
+		"event":    {Resource: 0, Scope: 0, Span: 1},
+		"link":     {Resource: 0, Scope: 0, Span: 1},
+	}, locations)
+}
+
 func stringValue(value string) *commonv1.AnyValue {
 	return &commonv1.AnyValue{Value: &commonv1.AnyValue_StringValue{StringValue: value}}
 }

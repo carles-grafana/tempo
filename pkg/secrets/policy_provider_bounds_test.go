@@ -94,7 +94,7 @@ func TestPolicyProviderOversizedRejectionLifecycle(t *testing.T) {
 		t.Run(fmt.Sprintf("last-good-%t", initialized), func(t *testing.T) {
 			source := &dynamicPolicySource{}
 			provider, _ := newDynamicTestProvider(source)
-			provider.compile = compiler.CompilePolicy
+			provider.compile = compiler.compileAdmitted
 			if initialized {
 				source.set(dynamicPolicy("DYNAMIC-OLD"), false)
 				_, ok := provider.current(context.Background())

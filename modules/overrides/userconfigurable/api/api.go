@@ -28,7 +28,7 @@ var errConflictingRuntimeOverrides = errors.New("tenant has conflicting override
 var tracer = otel.Tracer("modules/overrides/userconfigurable/api")
 
 type Validator interface {
-	Validate(limits *client.Limits) error
+	Validate(context.Context, *client.Limits) error
 }
 
 // UserConfigOverridesAPI manages the API to retrieve, update and delete user-configurable overrides
@@ -93,7 +93,7 @@ func (a *UserConfigOverridesAPI) set(ctx context.Context, userID string, limits 
 	defer span.End()
 	traceID, _ := tracing.ExtractTraceID(ctx)
 
-	err := a.validator.Validate(limits)
+	err := a.validator.Validate(ctx, limits)
 	if err != nil {
 		return "", newValidationError(err)
 	}
@@ -122,7 +122,7 @@ func (a *UserConfigOverridesAPI) update(ctx context.Context, userID string, patc
 
 	currLimits, currVersion, err := a.client.Get(ctx, userID)
 	if err != nil && !errors.Is(err, backend.ErrDoesNotExist) {
-		return nil, "", err
+		return nil, currVersion, err
 	}
 
 	level.Info(a.logger).Log("traceID", traceID, "msg", "patching user-configurable overrides", "userID", userID, "patch_bytes", len(patch), "currLimits", logLimits(currLimits), "currVersion", currVersion)
@@ -204,6 +204,11 @@ func (a *UserConfigOverridesAPI) parseLimits(body io.Reader) (*client.Limits, er
 
 func (a *UserConfigOverridesAPI) assertNoConflictingRuntimeOverrides(ctx context.Context, userID string) error {
 	limits, _, err := a.client.Get(ctx, userID)
+	if errors.Is(err, client.ErrInvalidSecretsPolicy) {
+		// The tenant already has a persisted document, just as for valid
+		// limits below. Full replacement still requires its backend version.
+		return nil
+	}
 	if err != nil && !errors.Is(err, backend.ErrDoesNotExist) {
 		return err
 	}

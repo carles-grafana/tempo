@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/go-kit/log"
+	"golang.org/x/time/rate"
 
 	"github.com/grafana/tempo/pkg/secrets"
 	"github.com/grafana/tempo/pkg/tempopb"
@@ -24,7 +25,7 @@ func BenchmarkCompiledPolicyDetect(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	policy, err := compiler.CompilePolicy(secrets.Policy{})
+	policy, err := compiler.CompilePolicy(context.Background(), secrets.Policy{})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -58,7 +59,7 @@ func BenchmarkCompiledPolicyDetectMaxCustomRules(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	policy, err := compiler.CompilePolicy(secrets.Policy{CustomRules: rules})
+	policy, err := compiler.CompilePolicy(context.Background(), secrets.Policy{CustomRules: rules})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -94,7 +95,7 @@ func BenchmarkTraceIDsForFieldManyScopes(b *testing.B) {
 	request := &tempopb.PushSpansRequest{
 		Batches: []*tracev1.ResourceSpans{{ScopeSpans: scopes}},
 	}
-	field := secrets.TraceField{Location: secrets.TraceLocation{Resource: 0, Scope: scopeCount - 1}}
+	field := secrets.TraceField{Location: secrets.TraceLocation{Resource: 0, Scope: scopeCount - 1, Span: -1}}
 	direct := make([][]byte, 1)
 
 	b.ReportAllocs()
@@ -140,6 +141,41 @@ func BenchmarkProcessorPushSpans(b *testing.B) {
 				p.PushSpans(context.Background(), req)
 			}
 		})
+	}
+}
+
+func BenchmarkProcessorPushSpansOTLPSharedFanout(b *testing.B) {
+	compiler, err := secrets.NewPolicyCompiler(&[]string{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	policy, err := compiler.CompilePolicy(context.Background(), secrets.Policy{CustomRules: []secrets.CustomRule{
+		{ID: "shared-rule", Regex: `CUSTOMER-[0-9]+`},
+	}})
+	if err != nil {
+		b.Fatal(err)
+	}
+	for _, fieldCount := range []int{16, 4096} {
+		for _, traceCount := range []int{16, 4096} {
+			b.Run(fmt.Sprintf("fields-%d/traces-%d", fieldCount, traceCount), func(b *testing.B) {
+				request := sharedOTLPRequest(b, fieldCount, traceCount)
+				p, err := New(Config{CompiledPolicy: policy}, "benchmark-shared", log.NewNopLogger(), nil)
+				if err != nil {
+					b.Fatal(err)
+				}
+				p.findingLogLimiter = rate.NewLimiter(0, 0)
+				p.coverageLogLimiter = rate.NewLimiter(0, 0)
+
+				b.ReportAllocs()
+				b.SetBytes(int64(request.Size()))
+				b.ResetTimer()
+				for range b.N {
+					p.PushSpans(context.Background(), request)
+				}
+				b.ReportMetric(float64(2*fieldCount), "shared-fields/op")
+				b.ReportMetric(float64(traceCount), "traces/op")
+			})
+		}
 	}
 }
 

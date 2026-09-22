@@ -91,7 +91,7 @@ func New(cfg Config, tenant string, logger log.Logger, tenantMetrics *TenantMetr
 				return nil, err
 			}
 		}
-		compiled, err = cfg.PolicyCompiler.CompilePolicy(secrets.Policy{})
+		compiled, err = cfg.PolicyCompiler.CompilePolicy(context.Background(), secrets.Policy{})
 		if err != nil {
 			return nil, err
 		}
@@ -137,14 +137,37 @@ func (p *Processor) PushSpans(_ context.Context, request *tempopb.PushSpansReque
 		p.duration.Observe(p.now().Sub(started).Seconds())
 	}()
 	var findingStates traceFindingStates
-	directTraceIDs := [1][]byte{}
-	sharedTraceIDs := map[traceSetKey][][]byte{}
+	var sharedTraceIDs map[traceSetKey][][]byte
+	reportingStopped := false
 	detector := p.policy.NewBatchDetector()
 
 	secrets.WalkPushSpansRequest(request, func(field secrets.TraceField) bool {
-		traceIDs := traceIDsForField(request, field, directTraceIDs[:], sharedTraceIDs)
 		verdict := detector.Detect(field.Value)
-		p.recordVerdict(field, verdict, traceIDs, &findingStates, started)
+		if !verdict.Matched() {
+			return true
+		}
+		scope := fieldScope(field.Kind)
+		for range verdict.Matches {
+			p.detectionsTotal[scope].Inc()
+			if p.tenantMetrics != nil {
+				p.tenantMetrics.recordDetection(scope)
+			}
+		}
+		if reportingStopped {
+			return true
+		}
+
+		// Attribution is only needed for reportable matches, never clean fields.
+		shared := field.Location.Span < 0
+		if shared && sharedTraceIDs == nil {
+			sharedTraceIDs = make(map[traceSetKey][][]byte)
+		}
+		var directTraceIDs [1][]byte
+		traceIDs := traceIDsForField(request, field, directTraceIDs[:], sharedTraceIDs)
+		traceIDs, reportingStopped = p.recordVerdict(field, verdict, traceIDs, &findingStates, started)
+		if shared && !reportingStopped {
+			sharedTraceIDs[traceSetKey{resource: field.Location.Resource, scope: field.Location.Scope}] = traceIDs
+		}
 		return true
 	})
 }
@@ -155,16 +178,9 @@ func (p *Processor) recordVerdict(
 	traceIDs [][]byte,
 	states *traceFindingStates,
 	started time.Time,
-) {
-	if !verdict.Matched() {
-		return
-	}
-	scope := fieldScope(field.Kind)
+) ([][]byte, bool) {
 	for _, match := range verdict.Matches {
-		p.detectionsTotal[scope].Inc()
-		if p.tenantMetrics != nil {
-			p.tenantMetrics.recordDetection(scope)
-		}
+		activeTraceIDs := traceIDs[:0]
 		for _, traceID := range traceIDs {
 			state := states.stateFor(traceID, field)
 			if state.findingLogs >= maxFindingLogsPerTrace {
@@ -172,15 +188,17 @@ func (p *Processor) recordVerdict(
 					state.findingLimitReported = true
 					p.logCoverageGap("finding_log_limit_exceeded", traceID, field, started)
 				}
+				// Remove exhausted shared candidates, so later matching fields
+				// do not repeat suppressed work for every descendant trace.
 				continue
 			}
 			if !p.findingLogLimiter.Allow() || !p.processFindingLogLimiter.Allow() {
-				if !state.findingRateLimitReported {
-					state.findingRateLimitReported = true
-					p.logCoverageGap("finding_log_rate_limit_exceeded", traceID, field, started)
-				}
-				continue
+				p.logCoverageGap("finding_log_rate_limit_exceeded", traceID, field, started)
+				// One representative diagnostic covers the rest of this batch.
+				// Detection continues, but neither fan-out nor attribution does.
+				return nil, true
 			}
+			activeTraceIDs = append(activeTraceIDs, traceID)
 			state.findingLogs++
 			if err := p.logFinding(
 				"msg", "secret detected in trace field",
@@ -194,7 +212,9 @@ func (p *Processor) recordVerdict(
 				p.logCoverageGap("finding_log_error", traceID, field, started)
 			}
 		}
+		traceIDs = activeTraceIDs
 	}
+	return traceIDs, false
 }
 
 type traceFindingKey struct {
@@ -202,19 +222,20 @@ type traceFindingKey struct {
 	invalidTraceID string
 	resource       int
 	scope          int
+	span           int
 }
 
 func traceFindingKeysEqual(left, right traceFindingKey) bool {
 	return left.traceID == right.traceID &&
 		left.resource == right.resource &&
 		left.scope == right.scope &&
+		left.span == right.span &&
 		left.invalidTraceID == right.invalidTraceID
 }
 
 type traceFindingState struct {
-	findingLogs              int
-	findingLimitReported     bool
-	findingRateLimitReported bool
+	findingLogs          int
+	findingLimitReported bool
 }
 
 type traceFindingStates struct {
@@ -267,11 +288,12 @@ func (s *traceFindingStates) stateFor(traceID []byte, field secrets.TraceField) 
 }
 
 func newTraceFindingKey(traceID []byte, field secrets.TraceField) traceFindingKey {
-	key := traceFindingKey{resource: -1, scope: -1}
+	key := traceFindingKey{resource: -1, scope: -1, span: -1}
 	switch len(traceID) {
 	case 0:
 		key.resource = field.Location.Resource
 		key.scope = field.Location.Scope
+		key.span = field.Location.Span
 	case len(key.traceID):
 		copy(key.traceID[:], traceID)
 	default:
@@ -319,7 +341,7 @@ type traceSetKey struct {
 }
 
 func traceIDsForField(request *tempopb.PushSpansRequest, field secrets.TraceField, direct [][]byte, shared map[traceSetKey][][]byte) [][]byte {
-	if len(field.TraceID) > 0 {
+	if field.Location.Span >= 0 {
 		direct[0] = field.TraceID
 		return direct
 	}

@@ -2,6 +2,7 @@ package overrides
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
@@ -10,9 +11,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	kitlog "github.com/go-kit/log"
 	"github.com/grafana/dskit/services"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/config"
@@ -23,12 +26,12 @@ import (
 
 	"github.com/grafana/tempo/pkg/secrets"
 	"github.com/grafana/tempo/pkg/sharedconfig"
+	tempolog "github.com/grafana/tempo/pkg/util/log"
 	"github.com/grafana/tempo/tempodb/backend"
 )
 
-func TestRuntimePolicyDecodeErrorsAreValueSafe(t *testing.T) {
+func TestMigrationPolicyDecodeErrorsAreValueSafe(t *testing.T) {
 	const private = "synthetic-private-policy-marker"
-	loader := loadPerTenantOverrides(&mockValidator{}, ConfigTypeNew, false, false)
 	for _, policy := range []string{
 		"custom_rules: " + private,
 		"custom_rules:\n- id: safe-rule\n  regex: " + private + "\n  description: " + private,
@@ -38,10 +41,6 @@ func TestRuntimePolicyDecodeErrorsAreValueSafe(t *testing.T) {
 		private + ": true",
 	} {
 		data := "overrides:\n  tenant:\n    metrics_generator:\n      processor:\n        secret_detection:\n          " + strings.ReplaceAll(policy, "\n", "\n          ") + "\n"
-		limits, err := loader(strings.NewReader(data))
-		require.True(t, err != nil, "invalid runtime policy must be rejected")
-		require.True(t, limits == nil, "invalid runtime policy must not be published")
-		require.False(t, strings.Contains(err.Error(), private), "runtime decode error disclosed private policy")
 		parsed, err := UnmarshalPerTenantOverrides([]byte(data))
 		require.True(t, err != nil, "invalid migration input must be rejected")
 		require.True(t, parsed == nil, "invalid migration input must not return limits")
@@ -60,6 +59,25 @@ func TestRuntimeOrdinaryDecodeDiagnostics(t *testing.T) {
 	require.Contains(t, err.Error(), "bad-limit")
 }
 
+func TestRuntimePolicyIsolationPreservesOrdinaryStrictness(t *testing.T) {
+	const private = "synthetic-private-policy-marker"
+	for _, legacy := range []bool{false, true} {
+		for _, ordinary := range []string{
+			"unknown_override: true",
+			"ingestion:\n  max_traces_per_user: bad-limit",
+		} {
+			data := runtimePolicyTestYAML(t, legacy, map[string]any{
+				"bad": map[string]any{private: true},
+			}, "invalid")
+			data += "  ordinary:\n    " + strings.ReplaceAll(ordinary, "\n", "\n    ") + "\n"
+			limits, err := loadPerTenantOverrides(nil, ConfigTypeNew, false, true)(strings.NewReader(data))
+			require.Error(t, err)
+			require.Nil(t, limits)
+			require.NotContains(t, err.Error(), private)
+		}
+	}
+}
+
 func TestRuntimeDuplicateConfigCannotHidePolicy(t *testing.T) {
 	const private = "synthetic-private-policy-marker"
 	data := []byte("overrides:\n  tenant:\n    metrics_generator:\n      processor:\n        secret_detection:\n          custom_rules: " + private + "\noverrides: {}\n")
@@ -69,6 +87,395 @@ func TestRuntimeDuplicateConfigCannotHidePolicy(t *testing.T) {
 	_, err = UnmarshalPerTenantOverrides(data)
 	require.Error(t, err)
 	require.NotContains(t, err.Error(), private)
+}
+
+type runtimeLogBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (b *runtimeLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *runtimeLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
+}
+
+func writeRuntimeOverridesFile(t *testing.T, path, data string) {
+	t.Helper()
+	var output bytes.Buffer
+	if strings.HasSuffix(path, ".gz") {
+		writer := gzip.NewWriter(&output)
+		_, err := writer.Write([]byte(data))
+		require.NoError(t, err)
+		require.NoError(t, writer.Close())
+	} else {
+		output.WriteString(data)
+	}
+	temporary := path + ".tmp"
+	require.NoError(t, os.WriteFile(temporary, output.Bytes(), 0o600))
+	require.NoError(t, os.Rename(temporary, path))
+}
+
+func reloadRuntimeOverridesFile(t *testing.T, manager *runtimeConfigOverridesManager, path, data string) {
+	t.Helper()
+	updates := manager.runtimeConfigMgr.CreateListenerChannel(1)
+	defer manager.runtimeConfigMgr.CloseListenerChannel(updates)
+	writeRuntimeOverridesFile(t, path, data)
+	select {
+	case <-updates:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runtime manager did not publish the updated overrides")
+	}
+}
+
+func TestRuntimeRawYAMLPrivacy(t *testing.T) {
+	const private = "synthetic-private-policy-marker"
+	for _, suffix := range []string{".yaml", ".yaml.gz"} {
+		for _, stage := range []string{"startup", "reload"} {
+			for _, invalid := range []struct {
+				name string
+				data string
+			}{
+				{"unknown alias", "custom_rules:\n- regex: *" + private},
+				{"duplicate private key", private + ": one\n" + private + ": two"},
+				{"invalid map key", "custom_rules:\n  ? [" + private + "]\n  : value"},
+			} {
+				t.Run(suffix+"/"+stage+"/"+invalid.name, func(t *testing.T) {
+					var logs runtimeLogBuffer
+					originalLogger := tempolog.Logger
+					tempolog.Logger = kitlog.NewLogfmtLogger(&logs)
+					t.Cleanup(func() { tempolog.Logger = originalLogger })
+
+					path := filepath.Join(t.TempDir(), "overrides"+suffix)
+					badConfig := "overrides:\n  tenant:\n    metrics_generator:\n      processor:\n        secret_detection:\n          " +
+						strings.ReplaceAll(invalid.data, "\n", "\n          ") + "\n"
+					initial := badConfig
+					if stage == "reload" {
+						initial = "overrides:\n  tenant:\n    forwarders: [before]\n"
+					}
+					writeRuntimeOverridesFile(t, path, initial)
+					service, err := newRuntimeConfigOverrides(Config{
+						ConfigType:              ConfigTypeNew,
+						PerTenantOverrideConfig: path,
+						PerTenantOverridePeriod: model.Duration(10 * time.Millisecond),
+					}, nil, prometheus.NewRegistry())
+					require.NoError(t, err)
+					manager := service.(*runtimeConfigOverridesManager)
+					err = services.StartAndAwaitRunning(context.Background(), service)
+					if stage == "startup" {
+						require.Error(t, err)
+						require.NotContains(t, err.Error(), private)
+						require.NotContains(t, service.FailureCase().Error(), private)
+						cause := manager.runtimeConfigMgr.FailureCase()
+						require.Error(t, cause)
+						require.Contains(t, cause.Error(), "configuration")
+						require.NotContains(t, cause.Error(), private)
+					} else {
+						require.NoError(t, err)
+						t.Cleanup(func() {
+							require.NoError(t, services.StopAndAwaitTerminated(context.Background(), service))
+						})
+						writeRuntimeOverridesFile(t, path, badConfig)
+						require.Eventually(t, func() bool {
+							return strings.Contains(logs.String(), "failed to load config")
+						}, 5*time.Second, time.Millisecond)
+						require.Equal(t, []string{"before"}, service.Forwarders("tenant"))
+						require.Equal(t, services.Running, service.State())
+						reloadRuntimeOverridesFile(t, manager, path, "overrides:\n  tenant:\n    forwarders: [after]\n")
+						require.Equal(t, []string{"after"}, service.Forwarders("tenant"))
+					}
+					require.NotContains(t, logs.String(), private)
+				})
+			}
+		}
+	}
+}
+
+func runtimePolicyTestYAML(t *testing.T, legacy bool, policies map[string]any, revision string) string {
+	t.Helper()
+	tenants := make(map[string]map[string]any, len(policies))
+	for tenant, policy := range policies {
+		limits := map[string]any{"forwarders": []string{revision}}
+		if policy != nil {
+			if legacy {
+				limits["metrics_generator_processor_secret_detection"] = policy
+			} else {
+				limits["metrics_generator"] = map[string]any{
+					"processor": map[string]any{"secret_detection": policy},
+				}
+			}
+		}
+		tenants[tenant] = limits
+	}
+	data, err := yaml.Marshal(map[string]any{"overrides": tenants})
+	require.NoError(t, err)
+	return string(data)
+}
+
+func TestRuntimePolicySchemaIsolation(t *testing.T) {
+	const private = "synthetic-private-policy-marker"
+	const native = "sk_test_" + "0123456789abcdefghijklmn"
+	const unselected = "xoxb-" + "1234567890-1234567890123-abcdefghijklmnopqrstuvwx"
+	makePolicy := func(id string) *secrets.Policy {
+		return &secrets.Policy{
+			DisabledRules: []string{"stripe-access-token"},
+			CustomRules:   []secrets.CustomRule{{ID: id, Regex: "CUSTOM-" + id}},
+		}
+	}
+	for _, legacy := range []bool{false, true} {
+		for _, invalid := range []struct {
+			name   string
+			policy any
+		}{
+			{"unknown field", map[string]any{private: true}},
+			{"wrong policy shape", []string{private}},
+			{"wrong rule type", map[string]any{"custom_rules": private}},
+		} {
+			t.Run(fmt.Sprintf("legacy=%t/%s", legacy, invalid.name), func(t *testing.T) {
+				var logs runtimeLogBuffer
+				originalLogger := tempolog.Logger
+				tempolog.Logger = kitlog.NewLogfmtLogger(&logs)
+				t.Cleanup(func() { tempolog.Logger = originalLogger })
+
+				path := filepath.Join(t.TempDir(), "overrides.yaml")
+				policies := map[string]any{
+					"bad":     invalid.policy,
+					"healthy": makePolicy("healthy-first"),
+					"*":       makePolicy("wildcard"),
+					"sparse":  nil,
+				}
+				writeRuntimeOverridesFile(t, path, runtimePolicyTestYAML(t, legacy, policies, "initial"))
+				typ := ConfigTypeNew
+				if legacy {
+					typ = ConfigTypeLegacy
+				}
+				service, err := newRuntimeConfigOverrides(Config{
+					ConfigType:              typ,
+					EnableLegacyOverrides:   legacy,
+					Defaults:                Overrides{MetricsGenerator: MetricsGeneratorOverrides{Processor: ProcessorOverrides{SecretDetection: makePolicy("default")}}},
+					PerTenantOverrideConfig: path,
+					PerTenantOverridePeriod: model.Duration(10 * time.Millisecond),
+				}, nil, prometheus.NewRegistry())
+				require.NoError(t, err)
+				require.NoError(t, services.StartAndAwaitRunning(context.Background(), service))
+				t.Cleanup(func() { require.NoError(t, services.StopAndAwaitTerminated(context.Background(), service)) })
+				manager := service.(*runtimeConfigOverridesManager)
+				compiler, err := secrets.NewPolicyCompiler(&[]string{"stripe-access-token"})
+				require.NoError(t, err)
+				bad := compiler.NewCompiledPolicyProvider("bad", service.SecretsPolicy, kitlog.NewNopLogger())
+				healthy := compiler.NewCompiledPolicyProvider("healthy", service.SecretsPolicy, kitlog.NewNopLogger())
+				missing := compiler.NewCompiledPolicyProvider("missing", service.SecretsPolicy, kitlog.NewNopLogger())
+				sparse := compiler.NewCompiledPolicyProvider("sparse", service.SecretsPolicy, kitlog.NewNopLogger())
+				probe := strings.Join([]string{
+					native, unselected, "CUSTOM-default", "CUSTOM-wildcard", "CUSTOM-bad-accepted", "CUSTOM-bad-unseen",
+					"CUSTOM-healthy-first", "CUSTOM-healthy-updated", "CUSTOM-healthy-recovered",
+				}, "\n")
+				assertVerdict := func(provider secrets.CompiledPolicyProvider, id string) {
+					t.Helper()
+					compiled, ok := provider(context.Background())
+					require.True(t, ok)
+					require.Equal(t, []secrets.Match{{RuleID: id}}, compiled.Detect(probe).Matches)
+				}
+				reload := func(revision string) {
+					t.Helper()
+					reloadRuntimeOverridesFile(t, manager, path, runtimePolicyTestYAML(t, legacy, policies, revision))
+					require.Equal(t, []string{revision}, service.Forwarders("healthy"))
+				}
+
+				// Bad startup policy must not suppress healthy tenants or inherit a
+				// default that disables the process-selected native fallback.
+				assertVerdict(bad, "stripe-access-token")
+				assertVerdict(healthy, "healthy-first")
+				assertVerdict(missing, "wildcard")
+				assertVerdict(sparse, "default")
+
+				policies["bad"] = makePolicy("bad-accepted")
+				policies["healthy"] = makePolicy("healthy-updated")
+				reload("accepted")
+				assertVerdict(bad, "bad-accepted")
+				assertVerdict(healthy, "healthy-updated")
+
+				// Publishing a decoded policy is not compilation. Skip observing
+				// this revision, then reject its replacement at schema decode.
+				policies["bad"] = makePolicy("bad-unseen")
+				reload("unobserved")
+				policies["bad"] = invalid.policy
+				policies["healthy"] = makePolicy("healthy-recovered")
+				reload("schema-rejected")
+				assertVerdict(bad, "bad-accepted")
+				assertVerdict(healthy, "healthy-recovered")
+
+				policies["bad"] = &secrets.Policy{CustomRules: []secrets.CustomRule{{ID: "invalid-regex", Regex: "("}}}
+				reload("compile-rejected")
+				assertVerdict(bad, "bad-accepted")
+				policies["bad"] = invalid.policy
+				reload("schema-after-compile-rejection")
+				assertVerdict(bad, "bad-accepted")
+
+				// Removing just the policy restores the default (not wildcard).
+				policies["bad"] = nil
+				reload("policy-removed")
+				assertVerdict(bad, "default")
+				policies["bad"] = invalid.policy
+				reload("schema-after-default")
+				assertVerdict(bad, "default")
+				fresh := compiler.NewCompiledPolicyProvider("bad", service.SecretsPolicy, kitlog.NewNopLogger())
+				assertVerdict(fresh, "stripe-access-token")
+
+				// Removing the tenant restores wildcard precedence; removing the
+				// wildcard policy then restores the default.
+				delete(policies, "bad")
+				reload("tenant-removed")
+				assertVerdict(bad, "wildcard")
+				policies["*"] = nil
+				reload("wildcard-policy-removed")
+				assertVerdict(bad, "default")
+				assertVerdict(missing, "default")
+
+				// An unrelated invalid override still rejects the complete reload;
+				// policy isolation must not weaken ordinary configuration validation.
+				policies["bad"] = invalid.policy
+				data := runtimePolicyTestYAML(t, legacy, policies, "ordinary-invalid")
+				data += "  ordinary:\n    unknown_override: true\n"
+				writeRuntimeOverridesFile(t, path, data)
+				require.Eventually(t, func() bool {
+					return strings.Contains(logs.String(), "failed to load config")
+				}, 5*time.Second, time.Millisecond)
+				require.Equal(t, []string{"wildcard-policy-removed"}, service.Forwarders("healthy"))
+				assertVerdict(bad, "default")
+				require.NotContains(t, logs.String(), private)
+				require.Contains(t, logs.String(), "secrets policy schema rejected")
+			})
+		}
+	}
+}
+
+func TestRuntimePolicyIsolationPreservesExpandedValues(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		for _, value := range []struct {
+			input     string
+			canonical string
+		}{
+			{"YES", "true"},
+			{"001", "1"},
+			{"on", "true"},
+			{"010", "8"},
+		} {
+			t.Run(fmt.Sprintf("legacy=%t/%s", legacy, value.input), func(t *testing.T) {
+				t.Setenv("RUNTIME_POLICY_PATTERN", value.input)
+				path := filepath.Join(t.TempDir(), "overrides.yaml")
+				data := runtimePolicyTestYAML(t, legacy, map[string]any{
+					"bad": map[string]any{"unsupported_policy_field": true},
+					"healthy": &secrets.Policy{CustomRules: []secrets.CustomRule{{
+						ID: "expanded", Regex: "${RUNTIME_POLICY_PATTERN}",
+					}}},
+				}, "initial")
+				if legacy {
+					data += "  ordinary:\n    metrics_generator_remote_write_headers:\n      X-Private: ${RUNTIME_POLICY_PATTERN}\n"
+				} else {
+					data += "  ordinary:\n    metrics_generator:\n      remote_write_headers:\n        X-Private: ${RUNTIME_POLICY_PATTERN}\n"
+				}
+				writeRuntimeOverridesFile(t, path, data)
+				typ := ConfigTypeNew
+				if legacy {
+					typ = ConfigTypeLegacy
+				}
+				service, err := newRuntimeConfigOverrides(Config{
+					ConfigType:              typ,
+					EnableLegacyOverrides:   legacy,
+					ExpandEnv:               true,
+					PerTenantOverrideConfig: path,
+					PerTenantOverridePeriod: model.Duration(time.Hour),
+				}, nil, prometheus.NewRegistry())
+				require.NoError(t, err)
+				require.NoError(t, services.StartAndAwaitRunning(context.Background(), service))
+				t.Cleanup(func() { require.NoError(t, services.StopAndAwaitTerminated(context.Background(), service)) })
+				compiler, err := secrets.NewPolicyCompiler(&[]string{})
+				require.NoError(t, err)
+				provider := compiler.NewCompiledPolicyProvider("healthy", service.SecretsPolicy, kitlog.NewNopLogger())
+				compiled, ok := provider(context.Background())
+				require.True(t, ok)
+				require.Equal(t, []secrets.Match{{RuleID: "expanded"}}, compiled.Detect(value.input).Matches)
+				require.Empty(t, compiled.Detect(value.canonical).Matches)
+				require.Equal(t, map[string]string{"X-Private": value.input}, service.MetricsGeneratorRemoteWriteHeaders("ordinary"))
+			})
+		}
+	}
+}
+
+func TestRuntimePolicyIsolationPreservesAliases(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("legacy=%t", legacy), func(t *testing.T) {
+			body := "    metrics_generator:\n      processor:\n        secret_detection:\n          custom_rules:\n          - id: anchored\n            regex: &pattern YES\n      remote_write_headers:\n        X-Private: *pattern\n"
+			if legacy {
+				body = "    metrics_generator_processor_secret_detection:\n      custom_rules:\n      - id: anchored\n        regex: &pattern YES\n    metrics_generator_remote_write_headers:\n      X-Private: *pattern\n"
+			}
+			data := "overrides:\n  template: &template\n" + body + "  tenant:\n    <<: *template\n"
+			data += strings.TrimPrefix(runtimePolicyTestYAML(t, legacy, map[string]any{
+				"bad": map[string]any{"unsupported_policy_field": true},
+			}, "initial"), "overrides:\n")
+			result, err := loadPerTenantOverrides(nil, ConfigTypeNew, false, legacy)(strings.NewReader(data))
+			require.NoError(t, err)
+			limits := result.(*perTenantOverrides)
+			compiler, err := secrets.NewPolicyCompiler(&[]string{})
+			require.NoError(t, err)
+			for _, tenant := range []string{"template", "tenant"} {
+				provider := compiler.NewCompiledPolicyProvider(tenant, func(id string) (*secrets.Policy, bool) {
+					return limits.TenantLimits[id].MetricsGenerator.Processor.SecretDetection, false
+				}, kitlog.NewNopLogger())
+				compiled, ok := provider(context.Background())
+				require.True(t, ok)
+				require.Equal(t, []secrets.Match{{RuleID: "anchored"}}, compiled.Detect("YES").Matches)
+				require.Empty(t, compiled.Detect("true").Matches)
+				require.Equal(t, map[string]string{"X-Private": "YES"}, limits.TenantLimits[tenant].MetricsGenerator.RemoteWriteHeaders.toStringStringMap())
+			}
+		})
+	}
+}
+
+func TestRuntimeRejectedPolicySkipsRecursiveAliases(t *testing.T) {
+	const anchor = "private-policy-anchor"
+	for _, legacy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("legacy=%t", legacy), func(t *testing.T) {
+			data := runtimePolicyTestYAML(t, legacy, map[string]any{
+				"healthy": &secrets.Policy{CustomRules: []secrets.CustomRule{{ID: "healthy", Regex: "HEALTHY"}}},
+			}, "initial")
+			if legacy {
+				data += "  bad:\n    metrics_generator_processor_secret_detection: &" + anchor + "\n      custom_rules:\n      - id: rejected\n        regex: *" + anchor + "\n"
+			} else {
+				data += "  bad:\n    metrics_generator:\n      processor:\n        secret_detection: &" + anchor + "\n          custom_rules:\n          - id: rejected\n            regex: *" + anchor + "\n"
+			}
+			loader := loadPerTenantOverrides(nil, ConfigTypeNew, false, legacy)
+			result, err := loader(strings.NewReader(data))
+			require.NoError(t, err)
+			limits := result.(*perTenantOverrides)
+			compiler, err := secrets.NewPolicyCompiler(&[]string{"stripe-access-token"})
+			require.NoError(t, err)
+			source := func(id string) (*secrets.Policy, bool) {
+				return limits.TenantLimits[id].MetricsGenerator.Processor.SecretDetection, false
+			}
+			bad := compiler.NewCompiledPolicyProvider("bad", source, kitlog.NewNopLogger())
+			compiled, ok := bad(context.Background())
+			require.True(t, ok)
+			require.Equal(t, []secrets.Match{{RuleID: "stripe-access-token"}}, compiled.Detect("sk_test_"+"0123456789abcdefghijklmn").Matches)
+			healthy := compiler.NewCompiledPolicyProvider("healthy", source, kitlog.NewNopLogger())
+			compiled, ok = healthy(context.Background())
+			require.True(t, ok)
+			require.Equal(t, []secrets.Match{{RuleID: "healthy"}}, compiled.Detect("HEALTHY").Matches)
+
+			// Referencing the same recursive payload from an ordinary override
+			// is not a policy-only error and must reject the complete config.
+			_, err = loader(strings.NewReader(data + "  ordinary:\n    forwarders: *" + anchor + "\n"))
+			require.Error(t, err)
+			require.NotContains(t, err.Error(), anchor)
+		})
+	}
 }
 
 func TestRuntimeConfigOverrides_loadPerTenantOverrides(t *testing.T) {

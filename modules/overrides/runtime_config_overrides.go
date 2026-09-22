@@ -2,6 +2,7 @@ package overrides
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	"github.com/grafana/dskit/services"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.yaml.in/yaml/v2"
+	yamlv3 "go.yaml.in/yaml/v3"
 
 	"github.com/grafana/tempo/modules/overrides/histograms"
 	"github.com/grafana/tempo/pkg/secrets"
@@ -86,10 +88,17 @@ func PolicySafeConfigError(data []byte, err error) error {
 	if yaml.UnmarshalStrict(data, &document) == nil && !containsPolicyConfig(document) {
 		return err
 	}
+	var details []string
 	var typeError *yaml.TypeError
+	var typeErrorV3 *yamlv3.TypeError
 	if errors.As(err, &typeError) {
-		locations := make([]string, 0, len(typeError.Errors))
-		for _, detail := range typeError.Errors {
+		details = typeError.Errors
+	} else if errors.As(err, &typeErrorV3) {
+		details = typeErrorV3.Errors
+	}
+	if details != nil {
+		locations := make([]string, 0, len(details))
+		for _, detail := range details {
 			if match := configErrorLine.FindStringSubmatch(detail); match != nil {
 				locations = append(locations, "line "+match[1])
 			}
@@ -132,32 +141,159 @@ func (o *perTenantOverrides) forUser(userID string) *Overrides {
 	return l
 }
 
+// preprocessPerTenantOverrides guards dskit's raw YAML parsing, which runs before
+// the Loader and propagates errors through both reload logs and service startup.
+// Validate with the same decoder first so private YAML cannot reach that path.
+func preprocessPerTenantOverrides(path string) runtimeconfig.Preprocessor {
+	return func(data []byte) ([]byte, error) {
+		input := data
+		if strings.HasSuffix(path, ".gz") {
+			reader, err := gzip.NewReader(bytes.NewReader(data))
+			if err != nil {
+				return nil, fmt.Errorf("read gzipped overrides: %w", err)
+			}
+			defer reader.Close()
+			input, err = io.ReadAll(reader)
+			if err != nil {
+				return nil, fmt.Errorf("uncompress overrides: %w", err)
+			}
+		}
+		var document map[string]any
+		if err := yamlv3.Unmarshal(input, &document); err != nil {
+			return nil, PolicySafeConfigError(input, err)
+		}
+		return data, nil
+	}
+}
+
+type runtimePolicyValue struct {
+	policy   secrets.Policy
+	rejected bool
+}
+
+func (p *runtimePolicyValue) UnmarshalYAML(unmarshal func(any) error) error {
+	if err := unmarshal(&p.policy); err != nil {
+		p.policy = secrets.RejectedPolicy()
+		p.rejected = true
+	}
+	return nil
+}
+
+// Mask policy slots without canonicalizing unrelated scalar values. Resolve
+// aliases into copies before masking each occurrence: an ordinary field may
+// reference an anchor inside a policy that will no longer appear in the YAML.
+func maskRuntimePolicyNodes(node *yamlv3.Node, path []string, aliases map[*yamlv3.Node]bool) (*yamlv3.Node, error) {
+	if len(path) == 3 && path[0] == "overrides" && path[2] == "metrics_generator_processor_secret_detection" ||
+		len(path) == 5 && path[0] == "overrides" && path[2] == "metrics_generator" && path[3] == "processor" && path[4] == "secret_detection" {
+		return &yamlv3.Node{Kind: yamlv3.ScalarNode, Tag: "!!null", Value: "null"}, nil
+	}
+	if node.Kind == yamlv3.AliasNode {
+		if aliases[node.Alias] {
+			return nil, errors.New("invalid recursive YAML alias")
+		}
+		aliases[node.Alias] = true
+		result, err := maskRuntimePolicyNodes(node.Alias, path, aliases)
+		delete(aliases, node.Alias)
+		return result, err
+	}
+	result := *node
+	result.Anchor = ""
+	result.Content = make([]*yamlv3.Node, len(node.Content))
+	for i, child := range node.Content {
+		parentDepth := len(path)
+		if node.Kind == yamlv3.MappingNode && i%2 == 1 && result.Content[i-1].Tag != "!!merge" {
+			path = append(path, result.Content[i-1].Value)
+		}
+		value, err := maskRuntimePolicyNodes(child, path, aliases)
+		path = path[:parentDepth]
+		if err != nil {
+			return nil, err
+		}
+		result.Content[i] = value
+	}
+	return &result, nil
+}
+
+// Decode policies separately from ordinary overrides. A schema rejection is an
+// explicit input to the policy provider, not a valid empty policy or the last
+// decoded policy: only the provider knows the last successfully compiled policy.
+func decodeRuntimeOverrides(input []byte) (*perTenantOverrides, error) {
+	// Decode policies from their original YAML nodes, not a generic-map
+	// round-trip: string fields must retain scalar spelling after env expansion.
+	var decoded struct {
+		TenantLimits map[string]struct {
+			Legacy    *runtimePolicyValue `yaml:"metrics_generator_processor_secret_detection"`
+			Generator struct {
+				Processor struct {
+					Policy *runtimePolicyValue `yaml:"secret_detection"`
+					Other  map[string]any      `yaml:",inline"`
+				} `yaml:"processor"`
+				Other map[string]any `yaml:",inline"`
+			} `yaml:"metrics_generator"`
+			Other map[string]any `yaml:",inline"`
+		} `yaml:"overrides"`
+	}
+	if err := yaml.UnmarshalStrict(input, &decoded); err != nil {
+		return nil, PolicySafeConfigError(input, err)
+	}
+	policies := make(map[string]*secrets.Policy)
+	for tenant, limits := range decoded.TenantLimits {
+		value := limits.Legacy
+		if value == nil {
+			value = limits.Generator.Processor.Policy
+		}
+		if value == nil {
+			continue
+		}
+		if value.rejected {
+			level.Warn(log.Logger).Log("msg", "secrets policy schema rejected; retaining last-known-good or native policy", "tenant", tenant)
+		}
+		policies[tenant] = &value.policy
+	}
+	data := input
+	if len(policies) > 0 {
+		var document yamlv3.Node
+		if err := yamlv3.Unmarshal(input, &document); err != nil {
+			return nil, PolicySafeConfigError(input, err)
+		}
+		masked, err := maskRuntimePolicyNodes(&document, nil, make(map[*yamlv3.Node]bool))
+		if err != nil {
+			return nil, PolicySafeConfigError(input, err)
+		}
+		data, err = yamlv3.Marshal(masked)
+		if err != nil {
+			return nil, PolicySafeConfigError(input, err)
+		}
+	}
+	var overrides perTenantOverrides
+	if err := yaml.UnmarshalStrict(data, &overrides); err != nil {
+		return nil, PolicySafeConfigError(input, err)
+	}
+	for tenant, policy := range policies {
+		overrides.TenantLimits[tenant].MetricsGenerator.Processor.SecretDetection = policy
+	}
+	return &overrides, nil
+}
+
 // loadPerTenantOverrides is of type runtimeconfig.Loader
 func loadPerTenantOverrides(validator Validator, typ ConfigType, expandEnv bool, enableLegacy bool) func(r io.Reader) (interface{}, error) {
 	// var is outside closure to ensure it's not recreated on each call
 	var lastLegacyWarn time.Time
 	return func(r io.Reader) (interface{}, error) {
-		overrides := &perTenantOverrides{}
-
-		if expandEnv {
-			rr := r.(*bytes.Reader)
-			b, err := io.ReadAll(rr)
-			if err != nil {
-				return nil, err
-			}
-
-			s, err := envsubst.EvalEnv(string(b))
-			if err != nil {
-				return nil, fmt.Errorf("failed to expand env vars: %w", PolicySafeConfigError(b, err))
-			}
-			r = bytes.NewReader([]byte(s))
+		input, err := io.ReadAll(r)
+		if err != nil {
+			return nil, err
 		}
-
-		var input bytes.Buffer
-		decoder := yaml.NewDecoder(io.TeeReader(r, &input))
-		decoder.SetStrict(true)
-		if err := decoder.Decode(&overrides); err != nil {
-			return nil, PolicySafeConfigError(input.Bytes(), err)
+		if expandEnv {
+			expanded, err := envsubst.EvalEnv(string(input))
+			if err != nil {
+				return nil, fmt.Errorf("failed to expand env vars: %w", PolicySafeConfigError(input, err))
+			}
+			input = []byte(expanded)
+		}
+		overrides, err := decodeRuntimeOverrides(input)
+		if err != nil {
+			return nil, err
 		}
 
 		if overrides.ConfigType == ConfigTypeLegacy {
@@ -228,6 +364,7 @@ func newRuntimeConfigOverrides(cfg Config, validator Validator, registerer prome
 		runtimeCfg := runtimeconfig.Config{
 			LoadPath:     []string{cfg.PerTenantOverrideConfig},
 			ReloadPeriod: time.Duration(cfg.PerTenantOverridePeriod),
+			Preprocessor: preprocessPerTenantOverrides(cfg.PerTenantOverrideConfig),
 			Loader:       loadPerTenantOverrides(validator, cfg.ConfigType, cfg.ExpandEnv, cfg.EnableLegacyOverrides),
 		}
 		runtimeCfgMgr, err := runtimeconfig.New(runtimeCfg, "overrides", prometheus.WrapRegistererWithPrefix("tempo_", registerer), log.Logger)
